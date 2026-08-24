@@ -68,6 +68,22 @@ class TestConfig:
         assert fallback.public_base_url == "http://localhost:8080"
         assert "quorum" not in fallback.public_base_url
 
+    def test_the_two_operational_switches_default_off(self):
+        """Both change how a LIVE server behaves at deploy time, so neither may
+        be inherited: MCP_REQUIRE_BOUND_BEARER would break socialbot's bearer,
+        MCP_ACCEPT_LEGACY_TOKENS would relax a claim check. Opt in, per server,
+        per deploy."""
+        settings = Settings()
+        assert settings.require_bound_bearer is False
+        assert settings.accept_legacy_tokens is False
+
+    def test_the_two_operational_switches_read_their_env_vars(self, monkeypatch):
+        monkeypatch.setenv("MCP_REQUIRE_BOUND_BEARER", "true")
+        monkeypatch.setenv("MCP_ACCEPT_LEGACY_TOKENS", "true")
+        settings = Settings()
+        assert settings.require_bound_bearer is True
+        assert settings.accept_legacy_tokens is True
+
     def test_secrets_are_not_repr_leaked(self):
         """SecretStr, so a config dump in a log or an exception can't spill it."""
         assert SECRET not in repr(make_settings())

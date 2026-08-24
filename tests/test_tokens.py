@@ -331,6 +331,106 @@ class TestLegacyTokenRejection:
         assert claims["iss"] == BASE and claims["typ"] == "access"
 
 
+class TestLegacyTransitionWindow:
+    """MCP_ACCEPT_LEGACY_TOKENS — the alternative to that forced reconnect.
+
+    With it on, a pre-package token (no `aud`, no `v`) is read as format v1, so
+    the retrofit deploy is silent and every live session re-mints itself with
+    both claims on its next refresh. It is a deploy-window switch, not a mode:
+    off again inside the 7-day refresh TTL, by which point nothing legacy is
+    left. Default is OFF — a silent cutover has to be chosen, never inherited.
+
+    What it must NOT loosen: the signature, `iss`, `typ`, `exp`, or the audience
+    check on any token that actually carries an `aud`.
+    """
+
+    @staticmethod
+    def legacy(**claims) -> str:
+        return mint_raw(SECRET, aud=None, v=None, **claims)
+
+    @staticmethod
+    def transitional(**kwargs):
+        return make_provider(accept_legacy_tokens=True, **kwargs)
+
+    def test_it_is_off_by_default(self):
+        assert make_provider().settings.accept_legacy_tokens is False
+
+    async def test_a_live_session_survives_the_deploy(self):
+        loaded = await self.transitional().load_access_token(self.legacy())
+        assert loaded is not None
+        assert loaded.email == "staff@example.org"
+
+    async def test_a_legacy_refresh_re_mints_a_modern_pair(self):
+        """One-way door: the tokens that come back carry `aud` and `v`, so a
+        session upgrades itself and the switch can go off again."""
+        provider = self.transitional()
+        client = make_client()
+        legacy = self.legacy(typ="refresh", client_id=client.client_id)
+        rt = await provider.load_refresh_token(client, legacy)
+        assert rt is not None
+        out = await provider.exchange_refresh_token(client, rt, [])
+        for token in (out.access_token, out.refresh_token):
+            claims = decode(token)
+            assert claims["aud"] == SLUG
+            assert claims["v"] == TOKEN_VERSION
+
+    async def test_modern_tokens_keep_working_alongside(
+        self,
+    ):
+        provider = self.transitional()
+        assert (
+            await provider.load_access_token(provider._mint("access", "client-a", [], USER, 60))
+            is not None
+        )
+
+    async def test_another_servers_token_is_still_rejected(self):
+        """The one thing that would make this switch dangerous. A token with the
+        WRONG `aud` is rejected in transition mode too — only a token with NO
+        `aud` gets the benefit of the doubt, and only those two live servers ever
+        minted one."""
+        provider = self.transitional()
+        assert await provider.load_access_token(mint_raw(SECRET, audience=OTHER_SLUG)) is None
+
+    async def test_a_forged_signature_is_still_rejected(self):
+        assert await self.transitional().load_access_token(mint_raw(OTHER_SECRET)) is None
+
+    async def test_a_foreign_issuer_is_still_rejected(self):
+        provider = self.transitional()
+        assert (
+            await provider.load_access_token(
+                self.legacy(iss="https://fga-other-mcp.ondigitalocean.app")
+            )
+            is None
+        )
+
+    async def test_an_expired_legacy_token_is_still_rejected(self):
+        now = int(time.time())
+        provider = self.transitional()
+        assert await provider.load_access_token(self.legacy(iat=now - 7200, exp=now - 60)) is None
+
+    async def test_type_confusion_is_still_rejected(self):
+        provider = self.transitional()
+        assert await provider.load_access_token(self.legacy(typ="refresh")) is None
+
+    async def test_an_unknown_future_version_is_still_invalid_grant(self):
+        """Transition mode fills in a MISSING `v`; it does not accept any `v`.
+        A2's one-click re-auth has to survive the window."""
+        provider = self.transitional()
+        client = make_client()
+        rt = await provider.load_refresh_token(
+            client, provider._mint("refresh", client.client_id, [], USER, 600)
+        )
+        rt.token = mint_raw(SECRET, typ="refresh", client_id=client.client_id, v=99)
+        with pytest.raises(TokenError) as exc:
+            await provider.exchange_refresh_token(client, rt, [])
+        assert exc.value.error == "invalid_grant"
+
+    async def test_a_legacy_token_missing_client_id_is_still_rejected(self):
+        """The claims that were always required stay required."""
+        provider = self.transitional()
+        assert await provider.load_access_token(self.legacy(client_id=None)) is None
+
+
 class TestOffboardingWindow:
     def test_refresh_ttl_is_exactly_seven_days(self):
         """Refresh re-mints from claims and never re-contacts Okta, so this
@@ -375,6 +475,78 @@ class TestOffboardingWindow:
         rt = await provider.load_refresh_token(client, refresh)
         out = await provider.exchange_refresh_token(client, rt, [])
         assert decode(out.access_token)["aud"] == SLUG
+
+
+class TestRefreshHorizonHasNoFloor:
+    """The floored path, which the tests above never reached.
+
+    `remaining = max(60, exp - now)` looks defensive and is the laundering bug:
+    inside the last minute of a refresh token's life the floor makes the NEW exp
+    later than the old one. Every test above starts from a token with hours
+    left, where max(60, big) == big and nothing slides, so the bug lived in the
+    one window that matters — the end of the offboarding tail.
+    """
+
+    @staticmethod
+    def _refresh(client_id: str, *, seconds_left: int) -> tuple[str, int]:
+        now = int(time.time())
+        exp = now + seconds_left
+        return mint_raw(SECRET, typ="refresh", client_id=client_id, iat=now - 60, exp=exp), exp
+
+    async def test_a_refresh_with_seconds_left_gets_seconds_not_a_minute(self):
+        provider = make_provider()
+        client = make_client()
+        token, exp = self._refresh(client.client_id, seconds_left=5)
+        rt = await provider.load_refresh_token(client, token)
+        assert rt is not None
+        out = await provider.exchange_refresh_token(client, rt, [])
+        assert decode(out.refresh_token)["exp"] == exp
+
+    async def test_a_refresh_loop_in_the_final_minute_cannot_walk_the_horizon_out(self):
+        """The attack in full: a deactivated account scripting a refresh every
+        few seconds. Under the floor, exp crept forward ~5s per hop, forever."""
+        provider = make_provider()
+        client = make_client()
+        token, horizon = self._refresh(client.client_id, seconds_left=50)
+        for hop in range(12):
+            rt = await provider.load_refresh_token(client, token)
+            assert rt is not None
+            token = (await provider.exchange_refresh_token(client, rt, [])).refresh_token
+            assert decode(token)["exp"] == horizon, f"horizon moved on hop {hop}"
+
+    async def test_the_access_token_it_hands_back_still_dies_with_the_horizon(self):
+        """A 1h access token minted off a refresh token with 5s left would
+        outlive the tail it was supposed to be bounded by. It is capped."""
+        provider = make_provider()
+        client = make_client()
+        token, exp = self._refresh(client.client_id, seconds_left=5)
+        rt = await provider.load_refresh_token(client, token)
+        out = await provider.exchange_refresh_token(client, rt, [])
+        assert decode(out.access_token)["exp"] <= exp
+        assert out.expires_in <= 5
+
+    async def test_exchange_at_the_exact_horizon_is_invalid_grant_not_a_new_token(self):
+        """exp == now survives PyJWT's expiry check (it rejects exp < now), so
+        this is the boundary second the floor used to mint from. Driven through
+        the grant directly with a frozen clock, because the real path cannot be
+        held still on one second."""
+        from fga_mcp_auth.grants import GrantContext
+
+        now = 1_000_000
+
+        def never(*_args, **_kwargs):
+            raise AssertionError("minted a token at or past the horizon")
+
+        ctx = GrantContext(settings=make_provider().settings, mint=never, now=lambda: now)
+        with pytest.raises(TokenError) as exc:
+            await refresh_token_grant(
+                ctx,
+                make_client(),
+                lambda _tok: {"exp": now, "sub": "00u1", "email": USER["email"]},
+                "refresh-token",
+                [],
+            )
+        assert exc.value.error == "invalid_grant"
 
 
 class TestOffboardingTailEndToEnd:

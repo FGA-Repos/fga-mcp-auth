@@ -152,7 +152,9 @@ future change.
 | `OKTA_ISSUER` | **yes** | Org authorization server URL, e.g. `https://example.okta.com`. Endpoints come from its discovery document, never hardcoded. |
 | `OKTA_CLIENT_ID` | **yes** | The shared FGA OIDC app. |
 | `OKTA_CLIENT_SECRET` | **yes** | Used with `client_secret_basic` at the token exchange. |
-| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Must be `<MCP_SERVER_SLUG>.<random>`** — the server refuses to boot otherwise. |
+| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Should be `<MCP_SERVER_SLUG>.<random>`** — anything else boots with a loud warning (see `MCP_REQUIRE_BOUND_BEARER`). A value of exactly `<slug>.` is always fatal. |
+| `MCP_REQUIRE_BOUND_BEARER` | no | `true` turns that warning into a refusal to boot. Default off, so the retrofit does not force a same-minute bearer rotation. Flip it on per server once every caller holds the new value. |
+| `MCP_ACCEPT_LEGACY_TOKENS` | no | `true` accepts pre-package tokens (no `aud`, no `v`) as format v1, for a silent retrofit cutover. Default off. Turn it back off inside the 7-day refresh window. |
 | `OKTA_ALLOWED_GROUPS` | no | CSV. Server-wide login gate. Empty = any authenticated Okta user. **Non-empty with no groups claim on the app = everyone denied.** |
 | `OKTA_ALLOWED_EMAIL_DOMAINS` | no | CSV. Second login gate, checked beside groups. Empty = inert. |
 | `MCP_TOOL_GATING` | no | `true` enables `GroupGate`. Default off. |
@@ -178,11 +180,22 @@ Consumer-owned and untouched by this package: `MCP_TRANSPORT`, `MCP_HOST`,
 | — | `OKTA_CLIENT_SECRET` **(new)** |
 | — | `OKTA_ALLOWED_GROUPS`, `OKTA_ALLOWED_EMAIL_DOMAINS`, `MCP_TOOL_GATING` (optional) |
 
-For `fga-quorum-mcp` and `fga-ob3-mcp`, every name already matches; only
-`MCP_SERVER_SLUG` is new — but `MCP_BEARER_TOKEN` still has to be **re-issued**
-with the slug prefix on both, and every caller that holds it (socialbot,
-scripts, CI) updated in the same window. The server will not start with an
-unprefixed bearer.
+For `fga-quorum-mcp` and `fga-ob3-mcp`, every name already matches and only
+`MCP_SERVER_SLUG` is new, so the retrofit deploy needs **no credential
+rotation**: today's unprefixed `MCP_BEARER_TOKEN` keeps working (with a boot
+warning) and socialbot is untouched.
+
+Re-issuing the bearer is a **separate, later step**, and it is a three-place
+change — do all three inside one window:
+
+1. `MCP_BEARER_TOKEN` on the DO app → `<slug>.<random>`
+2. socialbot's config → the same value
+3. any script / CI job / saved curl that holds the old one
+4. then set `MCP_REQUIRE_BOUND_BEARER=true` so the old value can never come back
+
+Skipping (2) is a socialbot outage: every tool call 401s until its config
+catches up. The five password-era servers have no such history, so they should
+be issued a prefixed bearer and `MCP_REQUIRE_BOUND_BEARER=true` from the start.
 
 Each server also needs its Okta redirect URI registered on the shared app:
 `https://<app>.ondigitalocean.app/okta/callback`.
@@ -192,12 +205,14 @@ Each server also needs its Okta redirect URI registered on the shared app:
 * **Give every server its own `MCP_TOKEN_SECRET`.** The `aud` claim is the
   structural backstop against replaying one server's token at another, not a
   licence to share one key across seven DO apps.
-* **The service bearer is slug-bound at boot.** `MCP_BEARER_TOKEN` is an opaque
-  string, not a JWT, so it cannot carry `aud` — and it grants *more* than a user
-  token (never expires, unrestricted at the group gate). Requiring
-  `<MCP_SERVER_SLUG>.<random>` is what stops one shared bearer from opening
-  every server: the value teamtailor accepts cannot be a value congress also
-  accepts. Use a distinct random half per server as well.
+* **Slug-bind the service bearer.** `MCP_BEARER_TOKEN` is an opaque string, not
+  a JWT, so it cannot carry `aud` — and it grants *more* than a user token
+  (never expires, unrestricted at the group gate). A `<MCP_SERVER_SLUG>.<random>`
+  value is what stops one shared bearer from opening every server: the value
+  teamtailor accepts cannot be a value congress also accepts. Unbound values
+  boot with a warning so the live servers can be retrofitted without a
+  synchronized rotation; `MCP_REQUIRE_BOUND_BEARER=true` closes the door once
+  they have been re-issued. Distinct random half per server as well.
 * **`MCP_ALLOWED_HOST` is load-bearing.** Unset, `public_base_url` falls back to
   `http://localhost:8080` — the same string on every FGA MCP server. That is why
   it is boot-required, and why `aud` exists on top of it.
@@ -208,7 +223,18 @@ Each server also needs its Okta redirect URI registered on the shared app:
   rejected redirect URIs are logged by hostname only.
 * **Nothing user-supplied is reflected.** `/oauth/error` looks its reason up in
   a fixed table, and Okta's `error` parameter goes to the log rather than onto a
-  page on our own origin — escaping stops XSS but not phishing.
+  page on our own origin — escaping stops XSS but not phishing. The error
+  *codes* sent back to the client come from a fixed table too, so nothing Okta
+  chose ever travels onward.
+* **Login errors are delivered to the client, not just rendered.** A failed
+  callback 302s to the validated `redirect_uri` with `error` +
+  `error_description` + `state` (RFC 6749 §4.1.2.1) — `access_denied` when the
+  human was refused, `server_error` otherwise. Without that, claude.ai's
+  connector waits on a callback that never arrives and the user sees a spinner.
+  The exception is a request with **no** validated `redirect_uri` (unknown or
+  expired state, or a URI that never passed the allowlist): those still answer
+  on our own origin, because 302ing to an unchecked URI is the open redirect the
+  allowlist exists to remove.
 
 ## Token format
 
@@ -230,24 +256,39 @@ claude.ai renders as an inline Connect card and retries — so a future format
 change costs one click, never a 500.
 
 Access tokens live 1 hour, refresh tokens 7 days, and refresh does **not** slide
-the horizon.
+the horizon — no floor, no exceptions. A refresh with 5 seconds left returns a
+5-second pair; at 0 it returns `invalid_grant`. `REFRESH_TTL` is the offboarding
+tail, so anything that lets a loop walk the expiry forward (a `max(60, …)` floor
+did exactly that) is the end of the guarantee, not a rounding detail.
 
-### Deploying the retrofit costs one forced reconnect
+### Deploying the retrofit: one forced reconnect, or the transition switch
 
 `fga-quorum-mcp` and `fga-ob3-mcp` are live today and mint neither `aud` nor
-`v`. Both are required, so **the first deploy that takes this package invalidates
-every token those servers have already issued.** Every connected staff member is
-prompted to reconnect the connector, at the moment the deploy lands.
+`v`. Both are normally required, so **the first deploy that takes this package
+invalidates every token those servers have already issued.** Every connected
+staff member is prompted to reconnect, at the moment the deploy lands.
 
 It degrades cleanly rather than breaking: a legacy access token gets 401 +
 `WWW-Authenticate`, a legacy refresh gets `invalid_grant`, and claude.ai turns
 both into an inline Connect card and retries the tool call. The static
-`MCP_BEARER_TOKEN` path — socialbot included — does not go through this and is
-unaffected *provided its new slug-prefixed value is set in the same deploy*.
+`MCP_BEARER_TOKEN` path — socialbot included — does not go through this at all.
 
-This is not behavior-identical, and no test can catch it (the statelessness
-suite only proves same-version round-trips). Announce it, deploy it off-peak,
-and expect the reconnect prompts.
+Two ways to land it. **Pick one per server and put it in the PR body:**
+
+* **Accept the reconnect.** Deploy off-peak, announce it, expect the prompts.
+  One click each, no config to remove afterwards.
+* **Silent cutover.** Deploy with `MCP_ACCEPT_LEGACY_TOKENS=true`: existing
+  tokens verify as format v1, and each session re-mints itself with both claims
+  on its next refresh. Remove the var within the 7-day refresh window — by then
+  nothing legacy is left. While it is on, legacy tokens (which have no `aud`)
+  are not audience-checked; modern tokens still are, and a token bearing the
+  *wrong* `aud` is rejected either way.
+
+Neither option is behavior-identical, and no test can catch the cutover itself
+(the statelessness suite only proves same-version round-trips), so it is a
+deploy-timing decision for Jacob rather than an implementation detail.
+`TestLegacyTokenRejection` pins the default failure shape and
+`TestLegacyTransitionWindow` pins what the switch does and does not loosen.
 
 ## Release and pinning policy
 
@@ -282,13 +323,26 @@ safer of the two everywhere they differed, plus:
   `iss`.
 * **New — token format version (`v`).** Unrecognized versions degrade to
   `invalid_grant` instead of an exception.
-* **New — the service bearer is slug-bound.** `MCP_BEARER_TOKEN` must be
-  `<MCP_SERVER_SLUG>.<random>` or the server refuses to boot, so one bearer
-  cannot be shared across the fleet. **Both live servers need a re-issued value
-  and their callers updated.**
+* **New — the service bearer can be slug-bound.** `<MCP_SERVER_SLUG>.<random>`
+  stops one bearer being shared across the fleet. Warned about by default and
+  enforced by `MCP_REQUIRE_BOUND_BEARER`, so today's live values keep working
+  and re-issuing them (with socialbot's config, in the same window) is a
+  separate step rather than a condition of the retrofit deploy.
+* **New — `MCP_ACCEPT_LEGACY_TOKENS`**, the transition switch that turns the
+  forced reconnect above into a silent cutover. Default off.
 * **Fixed — a refresh token that fails verification** (an expiry crossed between
   the SDK's check and ours) used to mint an anonymous, indefinitely renewable
   session. It is now `invalid_grant`.
+* **Fixed — the refresh expiry could slide outward.** A `max(60, exp - now)`
+  floor meant a refresh inside the last minute of a token's life came back with
+  a *later* expiry than it went in with, so a loop could hold a session open
+  past `REFRESH_TTL` forever — the offboarding bound this package is built
+  around. The horizon is now hard, and it caps the access token minted with it.
+* **Fixed — login errors never reached the OAuth client.** A group-gate denial
+  or a failed Okta exchange rendered an HTML page on our origin, so claude.ai
+  sat waiting on a callback that never came. Failures now redirect to the
+  validated `redirect_uri` with `error` + `state` per RFC 6749 §4.1.2.1.
+  *Behavior change vs. live quorum/ob3, both of which show the dead page.*
 * **New — hardened redirect allowlist.** Exact-host matching for loopback, https
   required for `claude.ai`/`claude.com`, backslashes rejected outright.
 * **Fixed — a signed token with no `client_id`** used to raise `KeyError` and

@@ -118,13 +118,36 @@ class Settings(BaseSettings):
     # Static service token for socialbot, curl and CI. Optional: unset means the
     # service path simply does not exist. It is never a bypass of anything.
     #
-    # MUST be `<MCP_SERVER_SLUG>.<random>` — the provider refuses to boot
-    # otherwise. This is the service path's audience binding: the bearer is an
-    # opaque string with no claims to check, so the only way to stop one shared
-    # value from replaying across all seven servers (and handing an unrestricted
-    # principal to teamtailor's PII tools) is to make a shared value impossible
-    # to configure. Distinct random half per server too.
+    # SHOULD be `<MCP_SERVER_SLUG>.<random>`. The bearer is an opaque string with
+    # no claims to check, so a slug prefix is the service path's only audience
+    # binding — without it, one value pasted across all seven DO apps replays at
+    # every one of them (a leaked congress bearer opening teamtailor's PII
+    # tools). An unprefixed value logs a loud warning at boot and keeps working;
+    # MCP_REQUIRE_BOUND_BEARER=true turns that warning into a refusal to boot.
     bearer_token: SecretStr | None = Field(default=None, validation_alias="MCP_BEARER_TOKEN")
+
+    # Enforce the slug prefix above. Default OFF in v1.0.0 on purpose: quorum and
+    # ob3 are LIVE with unprefixed bearers, and socialbot holds those values, so
+    # a hard requirement would make the retrofit deploy a three-place credential
+    # rotation (DO env, socialbot config, scripts) with a socialbot outage in the
+    # gap. Flip it on per server once the bearer has been re-issued — that is a
+    # deliberate operational step, not something this package decides for the
+    # fleet. FLAGGED FOR JACOB: fleet-wide default-on is the end state.
+    require_bound_bearer: bool = Field(default=False, validation_alias="MCP_REQUIRE_BOUND_BEARER")
+
+    # Transition switch for the retrofit of the two LIVE servers. Tokens minted
+    # before this package carry neither `aud` nor `v`, both of which are normally
+    # required, so the first deploy invalidates every session at once and every
+    # connected staff member gets a reconnect card. With this set, a token
+    # missing those claims is accepted as format v1 for as long as it is on —
+    # a silent cutover instead of a synchronized reconnect.
+    #
+    # The cost, stated plainly: a legacy token has no `aud`, so while this is on
+    # the cross-server replay barrier is off FOR LEGACY TOKENS ONLY (modern
+    # tokens are still audience-checked, and a wrong `aud` is still rejected).
+    # Turn it on for the deploy, turn it off within the 7-day refresh window —
+    # by then every live session has been re-minted with both claims.
+    accept_legacy_tokens: bool = Field(default=False, validation_alias="MCP_ACCEPT_LEGACY_TOKENS")
 
     okta_issuer: str | None = Field(default=None, validation_alias="OKTA_ISSUER")
     okta_client_id: str | None = Field(default=None, validation_alias="OKTA_CLIENT_ID")

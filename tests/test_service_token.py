@@ -8,11 +8,14 @@ round-trip on top.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from conftest import (
     OTHER_SLUG,
     SERVICE_TOKEN,
     SLUG,
+    UNBOUND_SERVICE_TOKEN,
     make_client,
     make_provider,
     service_token_for,
@@ -78,6 +81,43 @@ class TestServiceTokenRobustness:
         assert await provider.load_access_token(SERVICE_TOKEN) is not None
 
 
+class TestUnboundBearerStillBoots:
+    """T1, the half that protects the live fleet.
+
+    Slug-binding the bearer is new in this package, and quorum + ob3 are LIVE
+    with unprefixed values that socialbot also holds. Enforcing the prefix by
+    default would make their retrofit a three-place credential rotation (DO env,
+    socialbot config, scripts) with a socialbot 401 in the gap — the exact
+    regression the plan's T1 gate exists to prevent. So an unbound bearer boots
+    and works; it just says so, loudly, in the log.
+    """
+
+    def test_todays_unprefixed_bearer_boots_and_keeps_working(self):
+        provider = make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+        assert provider is not None
+
+    async def test_todays_unprefixed_bearer_still_authenticates(self):
+        provider = make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+        loaded = await provider.load_access_token(UNBOUND_SERVICE_TOKEN)
+        assert loaded is not None and loaded.client_id == SERVICE_CLIENT_ID
+
+    def test_an_unbound_bearer_warns_at_boot(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+        assert "MCP_REQUIRE_BOUND_BEARER" in caplog.text
+        assert "not bound to this server" in caplog.text
+
+    def test_the_boot_warning_never_prints_the_bearer(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+        assert UNBOUND_SERVICE_TOKEN not in caplog.text
+
+    def test_a_correctly_bound_bearer_is_silent(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            make_provider(service_token=service_token_for(SLUG))
+        assert "MCP_REQUIRE_BOUND_BEARER" not in caplog.text
+
+
 class TestServiceTokenIsAudienceBound:
     """T3's service-path twin.
 
@@ -85,31 +125,45 @@ class TestServiceTokenIsAudienceBound:
     another. The service bearer has no claims to check — it is an opaque string
     compared byte-for-byte — and it grants MORE than a user token does
     (SERVICE_CLIENT_ID is unrestricted at the group gate and never expires). So
-    its binding is structural: `<MCP_SERVER_SLUG>.<random>` or no boot, which
-    makes one bearer shared across the seven DO apps a configuration that cannot
-    exist rather than one the README merely warns about.
+    its binding is structural: `<MCP_SERVER_SLUG>.<random>`, and with
+    MCP_REQUIRE_BOUND_BEARER on, one bearer shared across the seven DO apps is a
+    configuration that cannot exist rather than one the README merely warns
+    about. Flip it on per server once the bearer has been re-issued everywhere.
     """
 
-    def test_unprefixed_bearer_refuses_to_boot(self):
-        with pytest.raises(ValueError, match="MCP_SERVER_SLUG"):
-            make_provider(service_token="one-bearer-set-on-every-do-app")
+    def test_unprefixed_bearer_refuses_to_boot_when_required(self):
+        with pytest.raises(ValueError, match="MCP_REQUIRE_BOUND_BEARER"):
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN, require_bound_bearer=True)
 
     def test_another_servers_bearer_refuses_to_boot_here(self):
-        with pytest.raises(ValueError, match="MCP_SERVER_SLUG"):
-            make_provider(slug=SLUG, service_token=service_token_for(OTHER_SLUG))
+        with pytest.raises(ValueError, match="not bound to this server"):
+            make_provider(
+                slug=SLUG,
+                service_token=service_token_for(OTHER_SLUG),
+                require_bound_bearer=True,
+            )
 
-    def test_prefix_with_no_secret_after_it_refuses_to_boot(self):
-        with pytest.raises(ValueError, match="no secret after it"):
-            make_provider(service_token=f"{SLUG}.")
+    def test_prefix_with_no_secret_after_it_refuses_to_boot_either_way(self):
+        """Always fatal, switch or no switch: that is a truncated env var, and a
+        bearer of exactly "<slug>." is a guessable credential."""
+        for required in (False, True):
+            with pytest.raises(ValueError, match="no secret after it"):
+                make_provider(service_token=f"{SLUG}.", require_bound_bearer=required)
 
-    def test_bearer_without_a_server_slug_refuses_to_boot(self):
+    def test_bearer_without_a_server_slug_refuses_to_boot_when_required(self):
         """Nothing to bind to. Boot-required MCP_SERVER_SLUG makes this
         unreachable in production; it must still not degrade to unbound."""
         with pytest.raises(ValueError, match="MCP_SERVER_SLUG"):
-            make_provider(slug=None, service_token="unbindable-bearer")
+            make_provider(slug=None, service_token="unbindable-bearer", require_bound_bearer=True)
 
     def test_correctly_bound_bearer_boots(self):
         assert make_provider(service_token=service_token_for(SLUG)) is not None
+
+    def test_correctly_bound_bearer_boots_under_enforcement(self):
+        assert (
+            make_provider(service_token=service_token_for(SLUG), require_bound_bearer=True)
+            is not None
+        )
 
     async def test_teamtailors_bearer_does_not_open_congress(self):
         """The scenario in full: same MCP_TOKEN_SECRET, same issuer fallback,

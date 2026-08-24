@@ -87,11 +87,17 @@ class TestGroupGate:
             self._oidc({"Quorum-Users"}).check_authorized({"groups": "Quorum-Users"})
 
     async def test_allowlist_without_groups_claim_denies_the_whole_login(self):
-        """End-to-end version of the same trap: no code is issued at all."""
+        """End-to-end version of the same trap: no code is issued at all, and
+        the client is told `access_denied` rather than left waiting."""
+        from urllib.parse import parse_qs, urlparse
+
         gated = make_provider(allowed_groups=frozenset({"Quorum-Users"}))
         _, state = await start_login(gated)
         resp, _ = await run_callback(gated, state)
-        assert resp.status_code == 403
+        assert resp.status_code == 302
+        q = parse_qs(urlparse(resp.headers["location"]).query)
+        assert q["error"] == ["access_denied"]
+        assert "code" not in q
         assert gated._auth_codes == {}
 
     async def test_member_of_allowed_group_completes_login(self):

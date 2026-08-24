@@ -22,9 +22,11 @@ import pytest
 from conftest import (
     BASE,
     CLAUDE_REDIRECT,
+    HOSTILE,
     OKTA_CLIENT_ID,
     OKTA_ISSUER,
     OKTA_META,
+    PHISH_REDIRECT,
     SECRET,
     SERVICE_TOKEN,
     USER,
@@ -33,12 +35,19 @@ from conftest import (
     make_client,
     make_id_token,
     make_provider,
+    redirect_params,
     run_callback,
     start_login,
 )
-from mcp.server.auth.provider import AuthorizationCode, TokenError
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    RegistrationError,
+    TokenError,
+)
 
 from fga_mcp_auth import ACCESS_TTL, AUTH_CODE_TTL, MAX_CLIENTS
+from fga_mcp_auth.constants import REDIRECT_ERRORS
 
 
 class TestLoginHop:
@@ -178,9 +187,29 @@ class TestOktaCallbackHappyPath:
 
 
 class TestOktaCallbackRejections:
-    """Every rejection must (a) not 302 back to the client and (b) mint no code."""
+    """Every rejection must mint no code, and must reach the OAuth client.
 
-    def _assert_rejected(self, provider, resp):
+    Two shapes, split on whether we hold a validated redirect_uri:
+
+      * pending state we recognize -> 302 to that (allowlisted) URI carrying
+        `error` + `state` and no `code`, per RFC 6749 §4.1.2.1. Rendering an
+        HTML page here instead leaves claude.ai waiting on a callback that never
+        comes, which is the failure this suite now pins.
+      * no pending state (forged/expired) -> an error page on our own origin,
+        because there is no URI we are willing to 302 to.
+    """
+
+    def _assert_rejected(self, provider, resp, error="access_denied"):
+        assert provider._auth_codes == {}
+        assert provider._code_users == {}
+        assert resp.status_code == 302
+        q = redirect_params(resp)
+        assert resp.headers["location"].startswith(CLAUDE_REDIRECT)
+        assert q["error"] == error
+        assert q["state"] == "claude-state"  # the client's own state comes back
+        assert "code" not in q
+
+    def _assert_rejected_on_our_origin(self, provider, resp):
         assert resp.status_code >= 400
         assert resp.status_code != 302
         assert "location" not in {k.lower() for k in resp.headers}
@@ -193,15 +222,14 @@ class TestOktaCallbackRejections:
         resp, _ = await run_callback(
             provider, state, id_token=make_id_token(nonce="a-different-login")
         )
-        assert resp.status_code == 403
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "access_denied")
 
     async def test_wrong_audience_rejected(self, provider):
         """An id_token minted for a different Okta app must not work here."""
         _, state = await start_login(provider)
         token = make_id_token(nonce=provider._pending[state]["okta_nonce"], aud="0oaSOMEOTHERAPP")
         resp, _ = await run_callback(provider, state, id_token=token)
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
     async def test_wrong_issuer_in_id_token_rejected(self, provider):
         _, state = await start_login(provider)
@@ -209,7 +237,7 @@ class TestOktaCallbackRejections:
             nonce=provider._pending[state]["okta_nonce"], iss="https://evil.okta.com"
         )
         resp, _ = await run_callback(provider, state, id_token=token)
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
     async def test_expired_id_token_rejected(self, provider):
         _, state = await start_login(provider)
@@ -218,7 +246,7 @@ class TestOktaCallbackRejections:
             nonce=provider._pending[state]["okta_nonce"], iat=now - 3600, exp=now - 60
         )
         resp, _ = await run_callback(provider, state, id_token=token)
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
     async def test_id_token_signed_by_an_unknown_key_rejected(self, provider):
         """Signature check is real, not decorative."""
@@ -228,51 +256,51 @@ class TestOktaCallbackRejections:
         _, state = await start_login(provider)
         token = make_id_token(nonce=provider._pending[state]["okta_nonce"], key=rogue)
         resp, _ = await run_callback(provider, state, id_token=token)
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
     @pytest.mark.parametrize("missing", ["sub", "exp", "iat", "aud", "iss"])
     async def test_id_token_missing_a_required_claim_rejected(self, provider, missing):
         _, state = await start_login(provider)
         token = make_id_token(nonce=provider._pending[state]["okta_nonce"], **{missing: None})
         resp, _ = await run_callback(provider, state, id_token=token)
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
-    async def test_okta_rejecting_the_code_is_a_403(self, provider):
+    async def test_okta_rejecting_the_code_is_access_denied(self, provider):
         _, state = await start_login(provider)
         resp, _ = await run_callback(
             provider, state, token_status=400, token_body={"error": "invalid_grant"}
         )
-        assert resp.status_code == 403
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "access_denied")
 
     async def test_token_response_without_id_token_rejected(self, provider):
         _, state = await start_login(provider)
         resp, _ = await run_callback(
             provider, state, token_body={"access_token": "opaque-okta-token"}
         )
-        assert resp.status_code == 403
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "access_denied")
 
     async def test_issuer_mismatch_on_the_callback_rejected(self, provider):
         """RFC 9207: when the AS echoes `iss` it must match the one we trust —
         mix-up defence, and it fires BEFORE the code is spent."""
         _, state = await start_login(provider)
         resp, route = await run_callback(provider, state, iss="https://evil.okta.com")
-        assert resp.status_code == 400
         assert not route.called
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
 
     async def test_matching_issuer_on_the_callback_is_fine(self, provider):
         _, state = await start_login(provider)
         resp, _ = await run_callback(provider, state, iss=OKTA_ISSUER)
         assert resp.status_code == 302
+        assert "code" in redirect_params(resp)
 
     async def test_unknown_state_rejected(self, provider):
+        """No pending state means no validated redirect_uri, so this one CANNOT
+        302 — bouncing to a URI we never checked is the open redirect itself."""
         resp = await provider.handle_okta_callback(
             fake_request(state="forged-state", code="okta-code")
         )
         assert resp.status_code == 400
-        self._assert_rejected(provider, resp)
+        self._assert_rejected_on_our_origin(provider, resp)
 
     async def test_expired_pending_state_rejected(self, provider):
         _, state = await start_login(provider)
@@ -280,26 +308,106 @@ class TestOktaCallbackRejections:
         resp = await provider.handle_okta_callback(fake_request(state=state, code="c"))
         assert resp.status_code == 400
         assert state not in provider._pending
-        self._assert_rejected(provider, resp)
+        self._assert_rejected_on_our_origin(provider, resp)
 
     async def test_okta_error_param_logged_not_reflected(self, provider, caplog):
         """D3. Okta's error text is attacker-influenceable, so it goes to the log
-        rather than onto a page on our own origin during a login flow."""
+        rather than onto a page on our own origin — or into the redirect. The
+        client gets a code from our own fixed table instead."""
         _, state = await start_login(provider)
         with caplog.at_level(logging.WARNING):
             resp = await provider.handle_okta_callback(
                 fake_request(state=state, error="access_denied")
             )
-        assert resp.status_code == 400
-        assert "access_denied" not in resp.body.decode()
+        self._assert_rejected(provider, resp, "access_denied")
         assert "access_denied" in caplog.text
-        self._assert_rejected(provider, resp)
+
+    async def test_an_unrecognized_okta_error_becomes_server_error(self, provider):
+        """Only `access_denied` passes through as itself; anything else is
+        normalized, so Okta's string is never the value we emit."""
+        _, state = await start_login(provider)
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, error="okta_internal_thing")
+        )
+        self._assert_rejected(provider, resp, "server_error")
+        assert "okta_internal_thing" not in resp.headers["location"]
 
     async def test_missing_code_rejected(self, provider):
         _, state = await start_login(provider)
         resp = await provider.handle_okta_callback(fake_request(state=state))
-        assert resp.status_code == 400
-        self._assert_rejected(provider, resp)
+        self._assert_rejected(provider, resp, "server_error")
+
+    async def test_every_rejection_consumes_the_pending_state(self, provider):
+        """The flow is over once the client has its error, so a replay of the
+        same state must not get a second bite."""
+        _, state = await start_login(provider)
+        await provider.handle_okta_callback(fake_request(state=state, error="access_denied"))
+        assert state not in provider._pending
+        replay = await provider.handle_okta_callback(fake_request(state=state, code="c"))
+        assert replay.status_code == 400  # our origin: nothing left to redirect to
+
+
+class TestErrorsReachTheOAuthClient:
+    """The finding this class exists for: an HTML page on our origin is invisible
+    to claude.ai's connector flow. It is waiting on its callback URL, so a
+    failure that never arrives there is a spinner and a dead tab, not an error.
+    RFC 6749 §4.1.2.1 says deliver it to the (validated) redirect_uri."""
+
+    async def test_group_gate_denial_redirects_with_access_denied(self):
+        provider = make_provider(allowed_groups=frozenset({"MCP Admins"}))
+        _client, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state)
+        q = redirect_params(resp)
+        assert resp.status_code == 302
+        assert resp.headers["location"].startswith(CLAUDE_REDIRECT)
+        assert q["error"] == "access_denied"
+        assert "code" not in q
+
+    async def test_the_denial_reason_stays_in_the_log(self, caplog):
+        """`error_description` is our prose, not the gate's message: what a user
+        failed is not the OAuth client's to render."""
+        provider = make_provider(allowed_email_domains=frozenset({"allowed.example"}))
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            resp, _ = await run_callback(provider, state)
+        assert "email domain is not permitted" in caplog.text
+        assert "email domain is not permitted" not in resp.headers["location"]
+        assert redirect_params(resp)["error_description"] == REDIRECT_ERRORS["access_denied"]
+
+    async def test_error_redirect_omits_state_when_the_client_sent_none(self):
+        provider = make_provider()
+        _client, state = await start_login(provider, state=None)
+        resp = await provider.handle_okta_callback(fake_request(state=state, error="access_denied"))
+        assert "state" not in redirect_params(resp)
+
+    async def test_error_goes_to_the_clients_own_registered_uri(self):
+        """Not a hardcoded claude.ai — whatever passed the allowlist for this
+        client, which for a local connector is a loopback URL."""
+        provider = make_provider()
+        local = "http://localhost:33418/oauth/callback"
+        _client, state = await start_login(provider, redirect_uri=local)
+        resp = await provider.handle_okta_callback(fake_request(state=state, error="access_denied"))
+        assert resp.headers["location"].startswith(local)
+
+    async def test_a_disallowed_redirect_uri_is_still_never_a_302(self):
+        """The rule that survives: the no-redirect policy is for URIs that never
+        passed the allowlist, and /authorize still answers those on our origin."""
+        provider = make_provider()
+        client = make_client(PHISH_REDIRECT)
+        with pytest.raises(RegistrationError):
+            await provider.register_client(client)
+        target = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="c" * 43,
+                redirect_uri=PHISH_REDIRECT,
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        assert target == f"{BASE}/oauth/error?reason=redirect_not_allowed"
+        assert HOSTILE not in target
 
 
 class TestAuthCodeIdentityFailsClosed:
@@ -323,18 +431,23 @@ class TestAuthCodeIdentityFailsClosed:
 class TestCallbackErrorReflection:
     """D3, adversarially. Escaping stops XSS but not phishing — attacker-chosen
     prose on our own origin, mid-login, is the whole primitive ("Session expired,
-    call 1-800-...")."""
+    call 1-800-..."). Now that errors are delivered to the client, the same rule
+    covers the redirect: the outbound `error` and `error_description` come from a
+    fixed table, so the string never travels either way."""
 
-    async def test_okta_error_param_is_not_reflected_into_our_page(self, caplog):
+    def _sink(self, resp) -> str:
+        """Everywhere attacker-supplied text could surface: page and Location."""
+        return resp.body.decode() + resp.headers.get("location", "")
+
+    async def test_okta_error_param_is_not_reflected_anywhere(self, caplog):
         provider = make_provider()
         _client, state = await start_login(provider)
         with caplog.at_level(logging.WARNING):
             resp = await provider.handle_okta_callback(
                 fake_request(state=state, error="CALL 1-800-EVIL NOW")
             )
-        body = resp.body.decode()
-        assert resp.status_code == 400
-        assert "CALL 1-800-EVIL NOW" not in body
+        assert "CALL 1-800-EVIL NOW" not in self._sink(resp)
+        assert "1-800-EVIL" not in self._sink(resp)
         # ...but it is still recoverable for debugging.
         assert "CALL 1-800-EVIL NOW" in caplog.text
 
@@ -345,10 +458,20 @@ class TestCallbackErrorReflection:
         resp = await provider.handle_okta_callback(
             fake_request(state=state, error="<script>alert(1)</script>")
         )
-        body = resp.body.decode()
-        assert "<script>" not in body
-        assert "&lt;script&gt;" not in body
-        assert "alert(1)" not in body
+        sink = self._sink(resp)
+        assert "<script>" not in sink
+        assert "&lt;script&gt;" not in sink
+        assert "alert(1)" not in sink
+
+    async def test_the_error_code_is_always_one_of_ours(self):
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, error="access_denied&code=forged")
+        )
+        q = redirect_params(resp)
+        assert q["error"] in REDIRECT_ERRORS
+        assert "code" not in q  # no query smuggling through the error string
 
 
 class TestPendingStateHygiene:
@@ -429,13 +552,19 @@ class TestSecretsNeverLeak:
             FGAAuthProvider(make_settings(secret="short-secret"))
         assert "short-secret" not in str(exc.value)
 
-    async def test_error_pages_never_contain_the_signing_or_client_secret(self):
+    async def test_error_responses_never_contain_the_signing_or_client_secret(self):
         provider = make_provider()
         _client, state = await start_login(provider)
         resp = await provider.handle_okta_callback(fake_request(state=state, error="access_denied"))
-        body = resp.body.decode()
+        sink = resp.body.decode() + resp.headers.get("location", "")
         for secret in (SECRET, SERVICE_TOKEN, "okta-client-secret"):
-            assert secret not in body
+            assert secret not in sink
+
+    async def test_the_error_page_for_an_unknown_state_leaks_nothing(self):
+        provider = make_provider()
+        resp = await provider.handle_okta_callback(fake_request(state="nope", code="c"))
+        for secret in (SECRET, SERVICE_TOKEN, "okta-client-secret"):
+            assert secret not in resp.body.decode()
 
     async def test_auth_code_redirect_carries_only_code_and_state(self):
         """The 302 back to Claude must not smuggle identity or Okta material."""

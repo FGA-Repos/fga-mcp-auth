@@ -116,10 +116,16 @@ async def refresh_token_grant(
     Both failure modes of `verify` are fatal here, for the same reason as in
     authorization_code_grant: no claims means no identity, and minting from an
     empty claim set would hand out a valid 1h access token for an anonymous
-    session. Worse, its refresh partner would floor at 60s and verify cleanly
-    on the next round trip, so the anonymous pair could be renewed every 60
-    seconds forever — an expired refresh token laundered into a permanent
-    session, and the end of the offboarding guarantee this docstring makes.
+    session — an expired refresh token laundered into a permanent session, and
+    the end of the offboarding guarantee this docstring makes.
+
+    The horizon is HARD, with no floor under it. An earlier version took
+    `max(60, exp - now)`, which looks like a harmless "don't mint a useless
+    token" guard and is actually the laundering bug itself: in the last minute
+    of a refresh token's life the floor makes the new `exp` LATER than the old
+    one, so a loop refreshing every ~55s walks the expiry forward forever and
+    REFRESH_TTL stops bounding anything. A refresh at second 59 now yields a
+    1-second refresh token, and one at second 60 yields `invalid_grant`.
     """
     try:
         claims = verify(refresh_token)
@@ -144,12 +150,32 @@ async def refresh_token_grant(
         raise TokenError("invalid_grant", "Refresh token is not valid; re-authenticate.")
 
     user = user_from_claims(claims)
-    remaining = max(60, int(claims.get("exp", 0)) - ctx.now())
+    now = ctx.now()
+    remaining = int(claims.get("exp", 0)) - now
+    if remaining <= 0:
+        logger.info(
+            "Refresh token reached its horizon; refusing to re-mint",
+            extra={
+                "client_id": client.client_id,
+                "server": ctx.settings.audience,
+                "event_category": "auth.refresh.expired",
+            },
+        )
+        raise TokenError("invalid_grant", "Refresh token has expired; re-authenticate.")
+
+    # `now` is threaded into the mint so the new `exp` is the OLD `exp` to the
+    # second. Recomputing the clock inside mint() would let each hop drift the
+    # horizon outward by up to a second, which over a long refresh loop is the
+    # same slide in slow motion.
+    #
+    # The access token is capped by the same horizon: a full 1h token minted off
+    # a refresh token with a minute left would outlive the tail it derives from.
+    access_ttl = min(ACCESS_TTL, remaining)
     return OAuthToken(
-        access_token=ctx.mint("access", client.client_id, scopes, user, ACCESS_TTL),
+        access_token=ctx.mint("access", client.client_id, scopes, user, access_ttl, now=now),
         token_type="Bearer",
-        expires_in=ACCESS_TTL,
-        refresh_token=ctx.mint("refresh", client.client_id, scopes, user, remaining),
+        expires_in=access_ttl,
+        refresh_token=ctx.mint("refresh", client.client_id, scopes, user, remaining, now=now),
     )
 
 

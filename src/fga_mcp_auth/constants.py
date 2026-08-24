@@ -65,3 +65,13 @@ ERROR_REASONS = {
     ),
 }
 ERROR_REASON_FALLBACK = "This sign-in request was rejected."
+
+# --- OAuth error responses --------------------------------------------------
+# The only error codes /okta/callback will send back to a client, with our own
+# descriptions. Fixed table for the same reason as ERROR_REASONS: neither Okta's
+# error string nor a denial message from the group gate is ever echoed onward.
+# Codes are RFC 6749 §4.1.2.1 values, which is what claude.ai parses.
+REDIRECT_ERRORS = {
+    "access_denied": "Sign-in was refused. Contact FGA IT if you expect access to this server.",
+    "server_error": "Sign-in could not be completed. Try connecting again.",
+}

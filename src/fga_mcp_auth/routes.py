@@ -2,6 +2,23 @@
 
 Handlers are free functions over a provider so both wiring helpers can mount the
 same code; `FGAAuthProvider` also exposes them as methods for direct testing.
+
+Two different ways to fail, and which one applies is decided by whether we hold
+a VALIDATED redirect_uri for the request:
+
+  * No trusted redirect_uri (unknown/expired state, or a redirect_uri that never
+    passed the allowlist) -> render an error page on OUR origin. Bouncing to an
+    unvalidated URI is exactly the open redirect the allowlist exists to remove.
+  * A trusted redirect_uri (the pending login carries one that passed the
+    allowlist at DCR registration AND again at /authorize) -> 302 back to it
+    with `error`, `error_description` and the client's `state`, per RFC 6749
+    §4.1.2.1. This is the only way the OAuth client ever learns the flow failed:
+    an HTML page on our origin leaves claude.ai's connector waiting on a
+    callback that never arrives, with nothing to show the user but a spinner.
+
+The `error` code is drawn from a fixed set and the description is our own prose.
+Okta's error text never travels — not into the page (phishing on our origin) and
+not into the redirect either.
 """
 
 from __future__ import annotations
@@ -13,7 +30,7 @@ from typing import TYPE_CHECKING
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from .constants import ERROR_REASON_FALLBACK, ERROR_REASONS
+from .constants import ERROR_REASON_FALLBACK, ERROR_REASONS, REDIRECT_ERRORS
 from .okta import AuthzDenied
 from .urls import append_params
 
@@ -49,27 +66,29 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
     if isinstance(pending, Response):
         return pending
 
-    if error := params.get("error"):
+    def fail(error: str) -> Response:
         provider._pending.pop(state_key, None)
-        logger.warning("Okta returned error: %s", error)
-        # Don't reflect Okta's (attacker-influenceable) prose onto our own
-        # origin, even escaped — escaping stops XSS but not phishing, and
-        # attacker-chosen text on our domain mid-login is the whole primitive
-        # ("Session expired, call 1-800-..."). The log has the detail.
-        return HTMLResponse(error_html("Okta rejected the sign-in. Try again."), 400)
+        return error_redirect(pending, error)
+
+    if error := params.get("error"):
+        logger.warning("Okta returned error: %s", error, extra={"event_category": "auth.failure"})
+        # Okta's prose is attacker-influenceable, so only a code from our own
+        # fixed set travels — never Okta's string, in the page or the redirect.
+        # The log keeps the detail.
+        return fail("access_denied" if error == "access_denied" else "server_error")
 
     # RFC 9207: when the AS echoes `iss`, it must match the one we trust.
     # Mix-up defence, and it fires BEFORE the code is spent.
     assert provider._okta is not None
     meta = await provider._okta.metadata()
     if (returned := params.get("iss")) and returned.rstrip("/") != meta["issuer"].rstrip("/"):
-        provider._pending.pop(state_key, None)
         logger.error("Issuer mismatch: got %s want %s", returned, meta["issuer"])
-        return HTMLResponse(error_html("Issuer mismatch — login rejected."), 400)
+        return fail("server_error")
 
     code = params.get("code", "")
     if not code:
-        return HTMLResponse(error_html("Okta did not return an authorization code."), 400)
+        logger.warning("Okta callback carried neither a code nor an error")
+        return fail("server_error")
 
     try:
         claims = await provider._okta.exchange_and_verify(
@@ -77,13 +96,14 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
         )
         provider._okta.check_authorized(claims)
     except AuthzDenied as exc:
-        provider._pending.pop(state_key, None)
         logger.warning("Login denied: %s", exc, extra={"event_category": "auth.failure"})
-        return HTMLResponse(error_html(str(exc)), 403)
+        # The group/domain gate. `access_denied` is what tells claude.ai the
+        # human was refused rather than the server broken, and the reason stays
+        # in the log — a denial message is not the client's to render.
+        return fail("access_denied")
     except Exception:
-        provider._pending.pop(state_key, None)
         logger.exception("Okta callback failed")
-        return HTMLResponse(error_html("Sign-in failed. Please try again."), 500)
+        return fail("server_error")
 
     # Consume pending state, then issue our auth code — exactly where the
     # password check used to sit.
@@ -100,6 +120,21 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
     )
     out = {"code": our_code}
     if pending["original_state"]:
+        out["state"] = pending["original_state"]
+    return RedirectResponse(url=append_params(pending["redirect_uri"], out), status_code=302)
+
+
+def error_redirect(pending: dict, error: str) -> Response:
+    """RFC 6749 §4.1.2.1 error response, on the validated redirect_uri.
+
+    `error` must be a key of REDIRECT_ERRORS: the code and the description both
+    come from our own table, so nothing an attacker (or Okta) chose is echoed to
+    the client. `state` is the client's own value and is returned unchanged, as
+    the RFC requires — a client that cannot match the response to its request
+    has to treat it as unsolicited.
+    """
+    out = {"error": error, "error_description": REDIRECT_ERRORS[error]}
+    if pending.get("original_state"):
         out["state"] = pending["original_state"]
     return RedirectResponse(url=append_params(pending["redirect_uri"], out), status_code=302)
 

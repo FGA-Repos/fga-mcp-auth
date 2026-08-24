@@ -30,12 +30,15 @@ HOST = "fga-example-mcp.ondigitalocean.app"
 BASE = f"https://{HOST}"
 SLUG = "fga-quorum"
 OTHER_SLUG = "fga-ob3"
-# The static bearer is slug-bound: the provider refuses to boot unless
-# MCP_BEARER_TOKEN starts with "<MCP_SERVER_SLUG>.". Helpers derive it from the
-# slug under test so a provider built for another server gets that server's
-# bearer, exactly as the fleet is configured.
+# The static bearer is slug-bound when it carries the "<MCP_SERVER_SLUG>."
+# prefix (enforced at boot by MCP_REQUIRE_BOUND_BEARER, warned about otherwise).
+# Helpers derive it from the slug under test so a provider built for another
+# server gets that server's bearer, exactly as the fleet should be configured.
 SERVICE_SECRET = "static-service-token-for-verify-deployed"
 SERVICE_TOKEN = f"{SLUG}.{SERVICE_SECRET}"
+# What quorum and ob3 have set today: no slug, no structure. Accepted with a
+# boot warning unless MCP_REQUIRE_BOUND_BEARER is on.
+UNBOUND_SERVICE_TOKEN = "one-bearer-set-on-every-do-app"
 _DERIVE_SERVICE_TOKEN = object()  # sentinel: "whatever suits this slug"
 
 
@@ -76,6 +79,8 @@ ALL_ENV = [
     "OKTA_ALLOWED_GROUPS",
     "OKTA_ALLOWED_EMAIL_DOMAINS",
     "MCP_TOOL_GATING",
+    "MCP_REQUIRE_BOUND_BEARER",
+    "MCP_ACCEPT_LEGACY_TOKENS",
     "MCP_PORT",
 ]
 
@@ -146,6 +151,8 @@ def make_settings(
     slug: str | None = SLUG,
     okta: bool = True,
     tool_gating: bool = False,
+    require_bound_bearer: bool = False,
+    accept_legacy_tokens: bool = False,
 ) -> Settings:
     if service_token is _DERIVE_SERVICE_TOKEN:
         service_token = service_token_for(slug) if slug else None
@@ -160,6 +167,8 @@ def make_settings(
         allowed_groups=allowed_groups,
         allowed_email_domains=allowed_email_domains,
         tool_gating_enabled=tool_gating,
+        require_bound_bearer=require_bound_bearer,
+        accept_legacy_tokens=accept_legacy_tokens,
     )
 
 
@@ -181,6 +190,11 @@ def make_client(
         redirect_uris=list(redirect_uris or (CLAUDE_REDIRECT,)),
         grant_types=["authorization_code", "refresh_token"],
     )
+
+
+def redirect_params(resp) -> dict[str, str]:
+    """Query params of a 302's Location — how the OAuth client sees the outcome."""
+    return {k: v[0] for k, v in parse_qs(urlparse(resp.headers["location"]).query).items()}
 
 
 def fake_request(**query_params) -> SimpleNamespace:

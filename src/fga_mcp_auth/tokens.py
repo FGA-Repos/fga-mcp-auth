@@ -33,11 +33,18 @@ reconnect, at once, when the deploy lands.
 It degrades gracefully — a legacy access token is a 401 + WWW-Authenticate and
 a legacy refresh is `invalid_grant`, both of which claude.ai renders as an
 inline Connect card and retries, and the static MCP_BEARER_TOKEN path
-(socialbot, scripts) is untouched — but it is NOT behavior-identical, and no
-test can catch it: TestStatelessness only proves same-version round-trips. So
-it belongs in both retrofit PR bodies as a deploy-timing note, and it is
+(socialbot, scripts) is untouched — but it is NOT behavior-identical, so it is
 Jacob's call to accept, not an implementation detail. TestLegacyTokenRejection
-pins the shape of the failure.
+pins the shape of the failure, and it belongs in both retrofit PR bodies as a
+deploy-timing note (off-peak, announced).
+
+If a silent cutover is preferred instead, `MCP_ACCEPT_LEGACY_TOKENS=true` is the
+transition build: `aud` and `v` drop out of the required set and a token missing
+them is read as format v1, so live sessions survive the deploy and re-mint
+themselves with both claims on their next refresh. Turn it off inside the 7-day
+refresh window. While it is on, legacy tokens (only) are unaudienced, so the
+cross-server barrier is down for them — modern tokens are still checked, and a
+token bearing the WRONG `aud` is still rejected either way.
 """
 
 from __future__ import annotations
@@ -51,6 +58,10 @@ import jwt
 from .constants import TOKEN_VERSION
 
 REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "typ", "client_id", "v"]
+# The same set minus the two claims this package added, for the transition
+# window (MCP_ACCEPT_LEGACY_TOKENS). Everything that was ever a trust boundary
+# on the live servers — signature, `iss`, `typ`, `exp` — is still required.
+LEGACY_REQUIRED_CLAIMS = [c for c in REQUIRED_CLAIMS if c not in ("aud", "v")]
 
 
 class InvalidTokenFormat(Exception):
@@ -109,6 +120,7 @@ def verify(
     issuer: str,
     audience: str,
     kind: str,
+    accept_legacy: bool = False,
 ) -> dict[str, Any] | None:
     """Return the claims, or None if the token is not a valid `kind` token here.
 
@@ -116,6 +128,10 @@ def verify(
     OURS but the format version is not one this build understands — that
     distinction is what lets the token endpoint answer `invalid_grant` and
     prompt a re-auth instead of failing opaquely.
+
+    `accept_legacy` is the retrofit transition window: a pre-package token with
+    no `aud` and no `v` verifies as format v1 instead of being rejected. It never
+    loosens anything else, and a token that DOES carry `aud` is still held to it.
     """
     try:
         claims = jwt.decode(
@@ -124,7 +140,13 @@ def verify(
             algorithms=["HS256"],
             issuer=issuer,
             audience=audience,
-            options={"require": REQUIRED_CLAIMS},
+            options={
+                "require": LEGACY_REQUIRED_CLAIMS if accept_legacy else REQUIRED_CLAIMS,
+                # Turning the library's check off does NOT skip the check: an
+                # `aud` that is present is compared below. It only stops PyJWT
+                # from rejecting a token that has no `aud` at all.
+                "verify_aud": not accept_legacy,
+            },
         )
     except jwt.MissingRequiredClaimError as exc:
         if getattr(exc, "claim", None) == "v":
@@ -133,11 +155,22 @@ def verify(
     except jwt.InvalidTokenError:
         return None
 
-    if claims.get("v") != TOKEN_VERSION:
+    if accept_legacy and "aud" in claims and not _audience_matches(claims["aud"], audience):
+        return None
+    # A legacy token predates the `v` claim, so absent means v1 — the format
+    # those servers were already minting. A `v` that is present still has to be
+    # one we know, transition or not.
+    version = claims.get("v", TOKEN_VERSION if accept_legacy else None)
+    if version != TOKEN_VERSION:
         raise InvalidTokenFormat(f"unrecognized token format version {claims.get('v')!r}")
     if claims.get("typ") != kind:
         return None
     return claims
+
+
+def _audience_matches(claim: Any, audience: str) -> bool:
+    """`aud` may be a string or a list (RFC 7519 §4.1.3)."""
+    return audience in (claim if isinstance(claim, list) else [claim])
 
 
 def scopes_from(claims: dict[str, Any]) -> list[str]:

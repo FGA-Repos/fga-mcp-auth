@@ -117,47 +117,74 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
             )
 
     def _require_bound_service_token(self) -> None:
-        """The static bearer must name the server it belongs to, or no boot.
+        """Check the static bearer names the server it belongs to.
 
         A user token cannot be replayed at a sibling server because `aud` says
         which one minted it. The service bearer has no claims to check — it is
         an opaque string compared byte-for-byte — so an admin who sets one
         MCP_BEARER_TOKEN across the seven DO apps gives every holder of the
         congress bearer (a socialbot config, a CI log, a script) unrestricted
-        access to teamtailor's PII tools. Requiring the slug prefix makes that
-        configuration impossible instead of merely discouraged: the token
-        teamtailor accepts cannot be a token congress also accepts.
+        access to teamtailor's PII tools. A `<slug>.` prefix makes that
+        configuration visible, and with MCP_REQUIRE_BOUND_BEARER=true it makes
+        it impossible: the token teamtailor accepts cannot be a token congress
+        also accepts.
 
-        Fail loud, at boot, like every other config error here. A 401 for
-        socialbot discovered in production is the worse failure.
+        Enforcement is OPT-IN in v1.0.0, and that is a deployment fact, not
+        timidity: quorum and ob3 are live with unprefixed bearers that socialbot
+        also holds, so requiring the prefix turns their retrofit into a
+        three-place credential rotation with a socialbot outage in the gap —
+        precisely the regression the plan's T1 gate exists to prevent. Unbound
+        warns; the operator re-issues the bearer and flips the switch.
+
+        One shape is always fatal, switch or no switch: a bearer that IS the
+        prefix and nothing else. That is never a deliberate choice, it is a
+        truncated env var, and it would otherwise be a guessable credential.
         """
         if not self._service_token:
             return
-        if not self._audience:
-            raise ValueError(
-                "MCP_BEARER_TOKEN is set but MCP_SERVER_SLUG is not, so the service "
-                "bearer cannot be bound to a server. Set MCP_SERVER_SLUG and prefix "
-                "the bearer with it."
-            )
-        prefix = f"{self._audience}{SERVICE_TOKEN_SEPARATOR}"
-        if self._service_token.startswith(prefix):
+
+        prefix = f"{self._audience}{SERVICE_TOKEN_SEPARATOR}" if self._audience else None
+        if prefix and self._service_token.startswith(prefix):
             if len(self._service_token) > len(prefix):
                 return
             raise ValueError(
                 f"MCP_BEARER_TOKEN is only the prefix '{prefix}' with no secret after it. "
                 f"Use {prefix}<random>."
             )
-        raise ValueError(
-            "MCP_BEARER_TOKEN must be bound to this server: it has to start with "
-            f"'{prefix}' (MCP_SERVER_SLUG + '{SERVICE_TOKEN_SEPARATOR}'). The service "
-            "bearer never expires and is unrestricted, so one value shared across "
-            "servers replays at all of them. Generate one with: python3 -c "
-            f"\"import secrets; print('{prefix}' + secrets.token_urlsafe(32))\""
+
+        example = f"{self._audience or '<MCP_SERVER_SLUG>'}{SERVICE_TOKEN_SEPARATOR}"
+        detail = (
+            "MCP_BEARER_TOKEN is not bound to this server: it does not start with "
+            f"'{example}'. The service bearer never expires and is unrestricted, so "
+            "one value shared across servers replays at all of them. Re-issue it with: "
+            f"python3 -c \"import secrets; print('{example}' + secrets.token_urlsafe(32))\""
+        )
+        if not self._audience:
+            detail = (
+                "MCP_BEARER_TOKEN is set but MCP_SERVER_SLUG is not, so the service "
+                "bearer cannot be bound to a server at all. " + detail
+            )
+        if self.settings.require_bound_bearer:
+            raise ValueError(detail + " (MCP_REQUIRE_BOUND_BEARER is on.)")
+        logger.warning(
+            "%s Set MCP_REQUIRE_BOUND_BEARER=true once every caller holds the new value.",
+            detail,
+            extra={"event_category": "auth.config.warning"},
         )
 
     # --- our own token format ---------------------------------------------
 
-    def _mint(self, kind: str, client_id: str, scopes: list[str], user: dict, ttl: int) -> str:
+    def _mint(
+        self,
+        kind: str,
+        client_id: str,
+        scopes: list[str],
+        user: dict,
+        ttl: int,
+        now: int | None = None,
+    ) -> str:
+        """`now` pins `iat` so a caller can express an absolute horizon as a TTL
+        without the clock moving underneath it (see refresh_token_grant)."""
         return tokens.mint(
             secret=self._secret,
             issuer=self._issuer,
@@ -167,6 +194,7 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
             scopes=scopes,
             user=user,
             ttl=ttl,
+            now=now,
         )
 
     def _verify(self, token: str, kind: str) -> dict | None:
@@ -177,6 +205,7 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
             issuer=self._issuer,
             audience=self._audience,
             kind=kind,
+            accept_legacy=self.settings.accept_legacy_tokens,
         )
 
     def _prune(self) -> None:
@@ -289,9 +318,10 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         # Service token: static MCP_BEARER_TOKEN, never expires, used by
-        # socialbot, curl and deploy verification. Bound to this server at boot
-        # (see _require_bound_service_token), so a sibling server's bearer
-        # cannot match here. Checked BEFORE any JWT verification. .encode() both
+        # socialbot, curl and deploy verification. Slug-bound when the bearer
+        # carries the prefix (see _require_bound_service_token), so a sibling
+        # server's bearer cannot match here. Checked BEFORE any JWT
+        # verification. .encode() both
         # sides: compare_digest raises TypeError on a non-ASCII str, and headers
         # are latin-1 decoded, so `Bearer \xff` would 500 instead of 401 on an
         # unauthenticated path — and that 500 is itself a probe for whether a

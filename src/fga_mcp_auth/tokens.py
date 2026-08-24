@@ -23,6 +23,21 @@ Two claims exist here that neither source server had:
          InvalidTokenFormat, which callers turn into a 401 or an RFC-compliant
          `invalid_grant` — never a 500. That makes a future claim-set change
          degrade to a one-click re-auth in claude.ai instead of an outage.
+
+Both are in REQUIRED_CLAIMS, and that has a one-time deploy cost worth stating
+plainly rather than discovering: fga-quorum-mcp and fga-ob3-mcp are LIVE and
+mint neither claim, so the first deploy that takes this package rejects every
+token they have already issued. Every connected staff member is asked to
+reconnect, at once, when the deploy lands.
+
+It degrades gracefully — a legacy access token is a 401 + WWW-Authenticate and
+a legacy refresh is `invalid_grant`, both of which claude.ai renders as an
+inline Connect card and retries, and the static MCP_BEARER_TOKEN path
+(socialbot, scripts) is untouched — but it is NOT behavior-identical, and no
+test can catch it: TestStatelessness only proves same-version round-trips. So
+it belongs in both retrofit PR bodies as a deploy-timing note, and it is
+Jacob's call to accept, not an implementation detail. TestLegacyTokenRejection
+pins the shape of the failure.
 """
 
 from __future__ import annotations

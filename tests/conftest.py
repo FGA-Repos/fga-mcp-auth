@@ -30,7 +30,18 @@ HOST = "fga-example-mcp.ondigitalocean.app"
 BASE = f"https://{HOST}"
 SLUG = "fga-quorum"
 OTHER_SLUG = "fga-ob3"
-SERVICE_TOKEN = "static-service-token-for-verify-deployed"
+# The static bearer is slug-bound: the provider refuses to boot unless
+# MCP_BEARER_TOKEN starts with "<MCP_SERVER_SLUG>.". Helpers derive it from the
+# slug under test so a provider built for another server gets that server's
+# bearer, exactly as the fleet is configured.
+SERVICE_SECRET = "static-service-token-for-verify-deployed"
+SERVICE_TOKEN = f"{SLUG}.{SERVICE_SECRET}"
+_DERIVE_SERVICE_TOKEN = object()  # sentinel: "whatever suits this slug"
+
+
+def service_token_for(slug: str) -> str:
+    return f"{slug}.{SERVICE_SECRET}"
+
 
 OKTA_ISSUER = "https://example.okta.com"
 OKTA_CLIENT_ID = "0oaEXAMPLECLIENTID000"
@@ -129,13 +140,15 @@ def make_settings(
     *,
     allowed_groups: frozenset[str] = frozenset(),
     allowed_email_domains: frozenset[str] = frozenset(),
-    service_token: str | None = SERVICE_TOKEN,
+    service_token: str | None | object = _DERIVE_SERVICE_TOKEN,
     secret: str | None = SECRET,
     host: str | None = HOST,
     slug: str | None = SLUG,
     okta: bool = True,
     tool_gating: bool = False,
 ) -> Settings:
+    if service_token is _DERIVE_SERVICE_TOKEN:
+        service_token = service_token_for(slug) if slug else None
     return Settings(
         allowed_host=host,
         server_slug=slug,

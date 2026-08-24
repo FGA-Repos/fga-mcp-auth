@@ -91,6 +91,28 @@ class TestHttpAppWiring:
     def test_revocation_endpoint_deliberately_absent(self, app):
         assert "/revoke" not in _routes(app)
 
+    def test_a_custom_token_route_cannot_shadow_the_sdk_one(self, wired):
+        """The 2.0 half of the EMA mounting note in grants.py: same ordering,
+        so `custom_route("/token")` is dead code here too."""
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp, _provider, _kwargs = wired
+
+        @mcp.custom_route("/token", methods=["POST"])
+        async def _shadow_token(request):  # pragma: no cover - never reached
+            raise AssertionError("the SDK's /token should have matched first")
+
+        app = mcp.streamable_http_app(
+            json_response=True,
+            stateless_http=True,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=True, allowed_hosts=[HOST]
+            ),
+        )
+        routes = [r for r in app.routes if r.path == "/token"]
+        assert len(routes) == 2, "expected the SDK's /token and ours to coexist"
+        assert getattr(routes[0].endpoint, "__name__", "") != "_shadow_token"
+
 
 class TestUnauthenticatedRequests:
     def test_mcp_endpoint_rejects_an_anonymous_call(self, app):

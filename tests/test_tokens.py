@@ -26,7 +26,7 @@ from conftest import (
 )
 
 from fga_mcp_auth import ACCESS_TTL, REFRESH_TTL, TOKEN_VERSION, InvalidTokenFormat
-from fga_mcp_auth.grants import TokenError
+from fga_mcp_auth.grants import TokenError, refresh_token_grant
 
 
 class TestTokenMinting:
@@ -228,6 +228,107 @@ class TestTokenFormatVersion:
     def test_verify_raises_invalid_token_format_for_unknown_version(self, provider):
         with pytest.raises(InvalidTokenFormat):
             provider._verify(mint_raw(SECRET, v=999), "access")
+
+
+class TestRefreshFailsClosed:
+    """A refresh that cannot be verified must be `invalid_grant`, never a token.
+
+    The regression this pins: `verify(refresh_token) or {}` minted a fully-valid
+    1h access token for sub=""/email="" whenever verification failed, plus a
+    refresh partner whose TTL floored at 60s. That partner then verified
+    cleanly, floored at 60s again, and so on — an expired or forged refresh
+    token laundered into an anonymous session renewable every 60 seconds
+    forever, which is the exact opposite of the bounded offboarding tail
+    REFRESH_TTL is supposed to guarantee.
+    """
+
+    async def test_grant_refuses_to_mint_when_verification_returns_none(self, provider):
+        with pytest.raises(TokenError) as exc:
+            await refresh_token_grant(provider._grants, make_client(), lambda _t: None, "tok", [])
+        assert exc.value.error == "invalid_grant"
+
+    async def test_refresh_expiring_between_the_sdk_check_and_ours_is_invalid_grant(self, provider):
+        """Reachable in production: the SDK checks `expires_at` from the snapshot
+        load_refresh_token returned, and the token can cross `exp` before
+        exchange re-decodes it."""
+        client = make_client()
+        rt = await provider.load_refresh_token(
+            client, provider._mint("refresh", client.client_id, [], USER, 600)
+        )
+        rt.token = mint_raw(
+            SECRET, typ="refresh", client_id=client.client_id, exp=int(time.time()) - 1
+        )
+        with pytest.raises(TokenError) as exc:
+            await provider.exchange_refresh_token(client, rt, [])
+        assert exc.value.error == "invalid_grant"
+
+    async def test_refresh_signed_with_another_secret_is_invalid_grant(self, provider):
+        client = make_client()
+        rt = await provider.load_refresh_token(
+            client, provider._mint("refresh", client.client_id, [], USER, 600)
+        )
+        rt.token = mint_raw(OTHER_SECRET, typ="refresh", client_id=client.client_id)
+        with pytest.raises(TokenError) as exc:
+            await provider.exchange_refresh_token(client, rt, [])
+        assert exc.value.error == "invalid_grant"
+
+    async def test_an_unverifiable_refresh_cannot_be_renewed_in_a_loop(self, provider):
+        """The full attack, stated as a test: every round must raise, so there
+        is never a 60-second token to come back with."""
+        client = make_client()
+        rt = await provider.load_refresh_token(
+            client, provider._mint("refresh", client.client_id, [], USER, 600)
+        )
+        rt.token = mint_raw(SECRET, typ="refresh", client_id=client.client_id, v=None)
+        for _ in range(3):
+            with pytest.raises(TokenError):
+                await provider.exchange_refresh_token(client, rt, [])
+
+
+class TestLegacyTokenRejection:
+    """Deploy-time consequence of A1/A2, pinned rather than discovered.
+
+    fga-quorum-mcp and fga-ob3-mcp are LIVE and mint neither `aud` nor `v`, both
+    of which are in REQUIRED_CLAIMS. So the first deploy of the retrofit rejects
+    every token they have already issued: one forced reconnect for every
+    connected staff member, at deploy time. That is NOT behavior-identical, it
+    is in both retrofit PR bodies, and it is Jacob's call to accept.
+
+    What these tests hold is the shape of the failure — 401 on access,
+    `invalid_grant` on refresh, so claude.ai shows an inline Connect card and
+    retries the tool call. A 500, or (before the fail-closed fix above) an
+    anonymous session, would make the same deploy an incident.
+    """
+
+    @staticmethod
+    def legacy(**claims) -> str:
+        """A pre-retrofit token: our signature, our issuer, no `aud`, no `v`."""
+        return mint_raw(SECRET, aud=None, v=None, **claims)
+
+    async def test_legacy_access_token_is_a_clean_401(self, provider):
+        assert await provider.load_access_token(self.legacy()) is None
+
+    async def test_legacy_refresh_token_does_not_load(self, provider):
+        client = make_client()
+        legacy = self.legacy(typ="refresh", client_id=client.client_id)
+        assert await provider.load_refresh_token(client, legacy) is None
+
+    async def test_legacy_refresh_exchange_is_invalid_grant_not_a_500(self, provider):
+        client = make_client()
+        rt = await provider.load_refresh_token(
+            client, provider._mint("refresh", client.client_id, [], USER, 600)
+        )
+        rt.token = self.legacy(typ="refresh", client_id=client.client_id)
+        with pytest.raises(TokenError) as exc:
+            await provider.exchange_refresh_token(client, rt, [])
+        assert exc.value.error == "invalid_grant"
+
+    def test_the_rejection_is_the_missing_claims_not_the_signature(self):
+        """Otherwise this suite would pass for the wrong reason: the legacy token
+        really is one we would have signed and issued."""
+        claims = jwt.decode(self.legacy(), SECRET, algorithms=["HS256"], issuer=BASE, audience=None)
+        assert "aud" not in claims and "v" not in claims
+        assert claims["iss"] == BASE and claims["typ"] == "access"
 
 
 class TestOffboardingWindow:

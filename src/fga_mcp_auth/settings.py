@@ -117,6 +117,13 @@ class Settings(BaseSettings):
 
     # Static service token for socialbot, curl and CI. Optional: unset means the
     # service path simply does not exist. It is never a bypass of anything.
+    #
+    # MUST be `<MCP_SERVER_SLUG>.<random>` — the provider refuses to boot
+    # otherwise. This is the service path's audience binding: the bearer is an
+    # opaque string with no claims to check, so the only way to stop one shared
+    # value from replaying across all seven servers (and handing an unrestricted
+    # principal to teamtailor's PII tools) is to make a shared value impossible
+    # to configure. Distinct random half per server too.
     bearer_token: SecretStr | None = Field(default=None, validation_alias="MCP_BEARER_TOKEN")
 
     okta_issuer: str | None = Field(default=None, validation_alias="OKTA_ISSUER")

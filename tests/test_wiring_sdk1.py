@@ -91,6 +91,26 @@ class TestHttpAppWiring:
         mcp, _provider = wired
         assert mcp.settings.auth.client_registration_options.enabled is True
 
+    def test_a_custom_token_route_cannot_shadow_the_sdk_one(self, wired):
+        """Pins the EMA mounting note in grants.py.
+
+        FastMCP appends custom routes AFTER the SDK's auth routes and Starlette
+        matches first-route-wins, so `@mcp.custom_route("/token")` — the obvious
+        way to add the jwt-bearer grant — is silently dead code. If this test
+        ever fails the SDK changed its ordering, and that docstring (which sends
+        the next implementer to ASGI middleware or route-list surgery instead)
+        needs rewriting.
+        """
+        mcp, _provider = wired
+
+        @mcp.custom_route("/token", methods=["POST"])
+        async def _shadow_token(request):  # pragma: no cover - never reached
+            raise AssertionError("the SDK's /token should have matched first")
+
+        routes = [r for r in mcp.streamable_http_app().routes if r.path == "/token"]
+        assert len(routes) == 2, "expected the SDK's /token and ours to coexist"
+        assert getattr(routes[0].endpoint, "__name__", "") != "_shadow_token"
+
 
 class TestUnauthenticatedRequests:
     def test_mcp_endpoint_rejects_an_anonymous_call(self, app):

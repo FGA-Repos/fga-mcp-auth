@@ -41,7 +41,9 @@ Enterprise Managed Auth grant, say) lands once instead of seven times.
   an SSWS token in seven deploys plus a failure policy — deferred to v1.1.
 * **No EMA / jwt-bearer grant.** Waitlist-gated. `grants.py` keeps the door open
   (isolated grant handlers, RFC 8707 `resource` carried through) and nothing
-  more.
+  more. Its docstring also records how the grant will have to be *mounted* —
+  ASGI middleware or route-list surgery, because FastMCP appends custom routes
+  after the SDK's, so `custom_route("/token")` is dead code.
 * **Not an authorization model.** The group gate denies a tool call. What a tool
   then returns, and what it redacts, stays the consumer's problem.
 
@@ -150,7 +152,7 @@ future change.
 | `OKTA_ISSUER` | **yes** | Org authorization server URL, e.g. `https://example.okta.com`. Endpoints come from its discovery document, never hardcoded. |
 | `OKTA_CLIENT_ID` | **yes** | The shared FGA OIDC app. |
 | `OKTA_CLIENT_SECRET` | **yes** | Used with `client_secret_basic` at the token exchange. |
-| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. |
+| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Must be `<MCP_SERVER_SLUG>.<random>`** — the server refuses to boot otherwise. |
 | `OKTA_ALLOWED_GROUPS` | no | CSV. Server-wide login gate. Empty = any authenticated Okta user. **Non-empty with no groups claim on the app = everyone denied.** |
 | `OKTA_ALLOWED_EMAIL_DOMAINS` | no | CSV. Second login gate, checked beside groups. Empty = inert. |
 | `MCP_TOOL_GATING` | no | `true` enables `GroupGate`. Default off. |
@@ -168,7 +170,7 @@ Consumer-owned and untouched by this package: `MCP_TRANSPORT`, `MCP_HOST`,
 | Old | New |
 |---|---|
 | `MCP_ADMIN_PASSWORD` | *(removed — the password path is gone entirely)* |
-| `MCP_BEARER_TOKEN` | unchanged |
+| `MCP_BEARER_TOKEN` | same name, **new value required**: `<slug>.<random>` |
 | — | `MCP_TOKEN_SECRET` **(new)** |
 | — | `MCP_SERVER_SLUG` **(new)** |
 | — | `OKTA_ISSUER` **(new)** |
@@ -177,7 +179,10 @@ Consumer-owned and untouched by this package: `MCP_TRANSPORT`, `MCP_HOST`,
 | — | `OKTA_ALLOWED_GROUPS`, `OKTA_ALLOWED_EMAIL_DOMAINS`, `MCP_TOOL_GATING` (optional) |
 
 For `fga-quorum-mcp` and `fga-ob3-mcp`, every name already matches; only
-`MCP_SERVER_SLUG` is new.
+`MCP_SERVER_SLUG` is new — but `MCP_BEARER_TOKEN` still has to be **re-issued**
+with the slug prefix on both, and every caller that holds it (socialbot,
+scripts, CI) updated in the same window. The server will not start with an
+unprefixed bearer.
 
 Each server also needs its Okta redirect URI registered on the shared app:
 `https://<app>.ondigitalocean.app/okta/callback`.
@@ -187,6 +192,12 @@ Each server also needs its Okta redirect URI registered on the shared app:
 * **Give every server its own `MCP_TOKEN_SECRET`.** The `aud` claim is the
   structural backstop against replaying one server's token at another, not a
   licence to share one key across seven DO apps.
+* **The service bearer is slug-bound at boot.** `MCP_BEARER_TOKEN` is an opaque
+  string, not a JWT, so it cannot carry `aud` — and it grants *more* than a user
+  token (never expires, unrestricted at the group gate). Requiring
+  `<MCP_SERVER_SLUG>.<random>` is what stops one shared bearer from opening
+  every server: the value teamtailor accepts cannot be a value congress also
+  accepts. Use a distinct random half per server as well.
 * **`MCP_ALLOWED_HOST` is load-bearing.** Unset, `public_base_url` falls back to
   `http://localhost:8080` — the same string on every FGA MCP server. That is why
   it is boot-required, and why `aud` exists on top of it.
@@ -221,6 +232,23 @@ change costs one click, never a 500.
 Access tokens live 1 hour, refresh tokens 7 days, and refresh does **not** slide
 the horizon.
 
+### Deploying the retrofit costs one forced reconnect
+
+`fga-quorum-mcp` and `fga-ob3-mcp` are live today and mint neither `aud` nor
+`v`. Both are required, so **the first deploy that takes this package invalidates
+every token those servers have already issued.** Every connected staff member is
+prompted to reconnect the connector, at the moment the deploy lands.
+
+It degrades cleanly rather than breaking: a legacy access token gets 401 +
+`WWW-Authenticate`, a legacy refresh gets `invalid_grant`, and claude.ai turns
+both into an inline Connect card and retries the tool call. The static
+`MCP_BEARER_TOKEN` path — socialbot included — does not go through this and is
+unaffected *provided its new slug-prefixed value is set in the same deploy*.
+
+This is not behavior-identical, and no test can catch it (the statelessness
+suite only proves same-version round-trips). Announce it, deploy it off-peak,
+and expect the reconnect prompts.
+
 ## Release and pinning policy
 
 * Consumers **pin the full commit SHA**, in a tarball URL, with a comment naming
@@ -254,6 +282,13 @@ safer of the two everywhere they differed, plus:
   `iss`.
 * **New — token format version (`v`).** Unrecognized versions degrade to
   `invalid_grant` instead of an exception.
+* **New — the service bearer is slug-bound.** `MCP_BEARER_TOKEN` must be
+  `<MCP_SERVER_SLUG>.<random>` or the server refuses to boot, so one bearer
+  cannot be shared across the fleet. **Both live servers need a re-issued value
+  and their callers updated.**
+* **Fixed — a refresh token that fails verification** (an expiry crossed between
+  the SDK's check and ours) used to mint an anonymous, indefinitely renewable
+  session. It is now `invalid_grant`.
 * **New — hardened redirect allowlist.** Exact-host matching for loopback, https
   required for `claude.ai`/`claude.com`, backslashes rejected outright.
 * **Fixed — a signed token with no `client_id`** used to raise `KeyError` and

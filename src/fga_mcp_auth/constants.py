@@ -39,6 +39,15 @@ MAX_CLIENTS = 500
 SERVICE_CLIENT_ID = "fga-service-token"  # synthetic client_id for the static bearer
 OKTA_SCOPES = "openid email profile groups"
 
+# The static bearer is opaque, not a JWT, so it cannot carry an `aud` claim —
+# and it grants MORE than a user token does (SERVICE_CLIENT_ID is unrestricted
+# at the group gate, and never expires). Its audience binding is therefore
+# structural: it must begin with "<MCP_SERVER_SLUG>." or the server refuses to
+# boot. That makes reusing one bearer across the seven DO apps impossible rather
+# than merely discouraged — the exact convenience move `aud` defends against for
+# MCP_TOKEN_SECRET.
+SERVICE_TOKEN_SEPARATOR = "."
+
 # --- token format -----------------------------------------------------------
 # Carried as the `v` claim. Bump ONLY when the claim set changes incompatibly:
 # an unrecognized version is answered with RFC-compliant `invalid_grant`, which

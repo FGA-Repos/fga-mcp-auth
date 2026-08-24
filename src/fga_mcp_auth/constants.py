@@ -42,10 +42,11 @@ OKTA_SCOPES = "openid email profile groups"
 # The static bearer is opaque, not a JWT, so it cannot carry an `aud` claim —
 # and it grants MORE than a user token does (SERVICE_CLIENT_ID is unrestricted
 # at the group gate, and never expires). Its audience binding is therefore
-# structural: it must begin with "<MCP_SERVER_SLUG>." or the server refuses to
-# boot. That makes reusing one bearer across the seven DO apps impossible rather
-# than merely discouraged — the exact convenience move `aud` defends against for
-# MCP_TOKEN_SECRET.
+# structural: beginning with "<MCP_SERVER_SLUG>." is what stops one value being
+# reused across the seven DO apps — the exact convenience move `aud` defends
+# against for MCP_TOKEN_SECRET. Warned about by default, enforced at boot by
+# MCP_REQUIRE_BOUND_BEARER, because the two live servers hold unprefixed values
+# that socialbot also holds (see provider._require_bound_service_token).
 SERVICE_TOKEN_SEPARATOR = "."
 
 # --- token format -----------------------------------------------------------

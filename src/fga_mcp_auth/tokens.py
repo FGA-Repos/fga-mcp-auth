@@ -1,0 +1,130 @@
+"""Our own token format: stateless HS256 JWTs that ARE the session.
+
+There is no server-side store to check a token against — DO App Platform
+redeploys on every push, and in-memory tokens logged every staff session out on
+each deploy. So the signature, `iss`, `aud`, `typ` and `v` are the entire trust
+boundary.
+
+# shortcut: stateless tokens cannot be revoked before they expire, and stateless
+# refresh rotation cannot detect replay of an old refresh token. Access TTL is
+# kept short (1h) to bound the first; the second is accepted. Upgrade path if it
+# matters: a jti denylist in Postgres, or rotate MCP_TOKEN_SECRET to invalidate
+# every token at once.
+
+Two claims exist here that neither source server had:
+
+  `aud`  the canonical server slug. Seven FGA MCP servers share one Okta app and
+         may be handed the same MCP_TOKEN_SECRET by an admin taking a shortcut.
+         Before `aud`, the only boundary between them was `iss` — and `iss` falls
+         back to http://localhost:<port> on every one of them if MCP_ALLOWED_HOST
+         is unset. `aud` plus a boot-required MCP_SERVER_SLUG closes that.
+
+  `v`    the token format version. An unrecognized version raises
+         InvalidTokenFormat, which callers turn into a 401 or an RFC-compliant
+         `invalid_grant` — never a 500. That makes a future claim-set change
+         degrade to a one-click re-auth in claude.ai instead of an outage.
+"""
+
+from __future__ import annotations
+
+import secrets
+import time
+from typing import Any
+
+import jwt
+
+from .constants import TOKEN_VERSION
+
+REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "typ", "client_id", "v"]
+
+
+class InvalidTokenFormat(Exception):
+    """Signed by us, but in a token format this build does not recognize."""
+
+
+def user_from_claims(claims: dict[str, Any]) -> dict[str, Any]:
+    """The identity we carry forward, from either an Okta id_token or one of our
+    own refresh tokens. One place, so a new claim can't be added to only half."""
+    return {
+        "sub": claims.get("sub", ""),
+        "email": claims.get("email", ""),
+        "name": claims.get("name", ""),
+        "groups": claims.get("groups", []),
+    }
+
+
+def mint(
+    *,
+    secret: str,
+    issuer: str,
+    audience: str,
+    kind: str,
+    client_id: str,
+    scopes: list[str],
+    user: dict[str, Any],
+    ttl: int,
+    now: int | None = None,
+) -> str:
+    issued = int(time.time()) if now is None else now
+    return jwt.encode(
+        {
+            "iss": issuer,
+            "aud": audience,
+            "v": TOKEN_VERSION,
+            "sub": user.get("sub", ""),
+            "email": user.get("email", ""),
+            "name": user.get("name", ""),
+            "groups": user.get("groups", []),
+            "client_id": client_id,
+            "scope": " ".join(scopes),
+            "typ": kind,
+            "iat": issued,
+            "exp": issued + ttl,
+            "jti": secrets.token_urlsafe(12),
+        },
+        secret,
+        algorithm="HS256",
+    )
+
+
+def verify(
+    token: str,
+    *,
+    secret: str,
+    issuer: str,
+    audience: str,
+    kind: str,
+) -> dict[str, Any] | None:
+    """Return the claims, or None if the token is not a valid `kind` token here.
+
+    Raises InvalidTokenFormat (rather than returning None) when the signature is
+    OURS but the format version is not one this build understands — that
+    distinction is what lets the token endpoint answer `invalid_grant` and
+    prompt a re-auth instead of failing opaquely.
+    """
+    try:
+        claims = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            issuer=issuer,
+            audience=audience,
+            options={"require": REQUIRED_CLAIMS},
+        )
+    except jwt.MissingRequiredClaimError as exc:
+        if getattr(exc, "claim", None) == "v":
+            raise InvalidTokenFormat("token carries no format version") from exc
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+    if claims.get("v") != TOKEN_VERSION:
+        raise InvalidTokenFormat(f"unrecognized token format version {claims.get('v')!r}")
+    if claims.get("typ") != kind:
+        return None
+    return claims
+
+
+def scopes_from(claims: dict[str, Any]) -> list[str]:
+    raw = claims.get("scope") or ""
+    return raw.split() if raw else []

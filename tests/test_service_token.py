@@ -18,6 +18,7 @@ from conftest import (
     UNBOUND_SERVICE_TOKEN,
     make_client,
     make_provider,
+    make_settings,
     service_token_for,
 )
 
@@ -81,35 +82,72 @@ class TestServiceTokenRobustness:
         assert await provider.load_access_token(SERVICE_TOKEN) is not None
 
 
-class TestUnboundBearerStillBoots:
-    """T1, the half that protects the live fleet.
+class TestBindingIsTheDefault:
+    """The service path's half of "cross-server replay is impossible".
 
-    Slug-binding the bearer is new in this package, and quorum + ob3 are LIVE
-    with unprefixed values that socialbot also holds. Enforcing the prefix by
-    default would make their retrofit a three-place credential rotation (DO env,
-    socialbot config, scripts) with a socialbot 401 in the gap — the exact
-    regression the plan's T1 gate exists to prevent. So an unbound bearer boots
-    and works; it just says so, loudly, in the log.
+    `aud` gives a USER token that guarantee for free. The service bearer is an
+    opaque string compared byte-for-byte and grants strictly more (unrestricted
+    at the group gate, never expires), so its only binding is structural — and a
+    binding that ships default-OFF is one an admin never meets. Enforcement is
+    therefore the default, like MCP_ACCEPT_LEGACY_TOKENS: the safe configuration
+    is what you get by not thinking about it.
     """
 
-    def test_todays_unprefixed_bearer_boots_and_keeps_working(self):
-        provider = make_provider(service_token=UNBOUND_SERVICE_TOKEN)
-        assert provider is not None
+    def test_an_unbound_bearer_refuses_to_boot_by_default(self):
+        with pytest.raises(ValueError, match="not bound to this server"):
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+
+    def test_the_default_is_enforcement(self):
+        from fga_mcp_auth import Settings
+
+        assert Settings().require_bound_bearer is True
+        assert make_settings().require_bound_bearer is True
+
+    def test_the_refusal_never_prints_the_bearer(self):
+        with pytest.raises(ValueError) as exc:
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+        assert UNBOUND_SERVICE_TOKEN not in str(exc.value)
+
+    def test_the_refusal_names_the_escape_hatch(self):
+        """An operator hitting this on the quorum/ob3 retrofit needs to be told
+        how to get through the deploy, not just that they are blocked."""
+        with pytest.raises(ValueError, match="MCP_REQUIRE_BOUND_BEARER"):
+            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+
+
+class TestUnboundBearerEscapeHatch:
+    """T1, the half that protects the live fleet.
+
+    quorum + ob3 are LIVE with unprefixed bearers that socialbot also holds, so
+    enforcing the prefix on their first deploy would be a three-place credential
+    rotation (DO env, socialbot config, scripts) with a socialbot 401 in the gap
+    — the exact regression the plan's T1 gate exists to prevent. With
+    MCP_REQUIRE_BOUND_BEARER=false those two deploys still boot and today's
+    bearer still works; it just says so, loudly, in the log.
+    """
+
+    @staticmethod
+    def unbound(**kwargs):
+        return make_provider(
+            service_token=UNBOUND_SERVICE_TOKEN, require_bound_bearer=False, **kwargs
+        )
+
+    def test_todays_unprefixed_bearer_boots_with_the_hatch(self):
+        assert self.unbound() is not None
 
     async def test_todays_unprefixed_bearer_still_authenticates(self):
-        provider = make_provider(service_token=UNBOUND_SERVICE_TOKEN)
-        loaded = await provider.load_access_token(UNBOUND_SERVICE_TOKEN)
+        loaded = await self.unbound().load_access_token(UNBOUND_SERVICE_TOKEN)
         assert loaded is not None and loaded.client_id == SERVICE_CLIENT_ID
 
     def test_an_unbound_bearer_warns_at_boot(self, caplog):
         with caplog.at_level(logging.WARNING):
-            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+            self.unbound()
         assert "MCP_REQUIRE_BOUND_BEARER" in caplog.text
         assert "not bound to this server" in caplog.text
 
     def test_the_boot_warning_never_prints_the_bearer(self, caplog):
         with caplog.at_level(logging.WARNING):
-            make_provider(service_token=UNBOUND_SERVICE_TOKEN)
+            self.unbound()
         assert UNBOUND_SERVICE_TOKEN not in caplog.text
 
     def test_a_correctly_bound_bearer_is_silent(self, caplog):
@@ -125,10 +163,10 @@ class TestServiceTokenIsAudienceBound:
     another. The service bearer has no claims to check — it is an opaque string
     compared byte-for-byte — and it grants MORE than a user token does
     (SERVICE_CLIENT_ID is unrestricted at the group gate and never expires). So
-    its binding is structural: `<MCP_SERVER_SLUG>.<random>`, and with
-    MCP_REQUIRE_BOUND_BEARER on, one bearer shared across the seven DO apps is a
-    configuration that cannot exist rather than one the README merely warns
-    about. Flip it on per server once the bearer has been re-issued everywhere.
+    its binding is structural: `<MCP_SERVER_SLUG>.<random>`, required at boot, so
+    one bearer shared across the seven DO apps is a configuration that cannot
+    exist rather than one the README merely warns about. These tests pass the
+    flag explicitly to say what they are pinning; it is the default.
     """
 
     def test_unprefixed_bearer_refuses_to_boot_when_required(self):

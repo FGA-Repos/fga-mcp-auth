@@ -68,11 +68,36 @@ ERROR_REASONS = {
 ERROR_REASON_FALLBACK = "This sign-in request was rejected."
 
 # --- OAuth error responses --------------------------------------------------
-# The only error codes /okta/callback will send back to a client, with our own
+# The only outcomes /okta/callback will send back to a client, with our own
 # descriptions. Fixed table for the same reason as ERROR_REASONS: neither Okta's
 # error string nor a denial message from the group gate is ever echoed onward.
-# Codes are RFC 6749 §4.1.2.1 values, which is what claude.ai parses.
+#
+# BEHAVIOR CHANGE, FLAGGED: quorum and ob3 render these on-origin as HTML
+# 400/403/500. This package delivers them to the validated redirect_uri instead
+# (see routes.py) — claude.ai's connector is waiting on that callback, and an
+# HTML page it never fetches is a spinner. The cost is that the denial reason no
+# longer reaches a page we control, so the descriptions below have to carry the
+# next step themselves.
 REDIRECT_ERRORS = {
     "access_denied": "Sign-in was refused. Contact FGA IT if you expect access to this server.",
     "server_error": "Sign-in could not be completed. Try connecting again.",
+    # Denial-specific prose. Still ours, still fixed — the actionable half of
+    # what quorum's 403 page used to show, minus anything Okta wrote.
+    "account_not_permitted": (
+        "Your Okta account is not permitted to use this FGA server. Ask #it-help to be "
+        "added to its Okta group."
+    ),
+    "wrong_email_domain": (
+        "This server only accepts FGA accounts. Sign in with your FGA email address."
+    ),
 }
+
+# Table key -> the code that goes on the wire. Keys that are not listed send
+# themselves. RFC 6749 §4.1.2.1 defines the vocabulary claude.ai parses, so the
+# extra keys above are descriptions of an `access_denied`, not new codes.
+REDIRECT_ERROR_CODES = {
+    "account_not_permitted": "access_denied",
+    "wrong_email_domain": "access_denied",
+}
+# What may ever appear as `error=` on the wire.
+RFC6749_ERROR_CODES = frozenset({"access_denied", "server_error"})

@@ -31,13 +31,13 @@ BASE = f"https://{HOST}"
 SLUG = "fga-quorum"
 OTHER_SLUG = "fga-ob3"
 # The static bearer is slug-bound when it carries the "<MCP_SERVER_SLUG>."
-# prefix (enforced at boot by MCP_REQUIRE_BOUND_BEARER, warned about otherwise).
+# prefix, which is required at boot by default (MCP_REQUIRE_BOUND_BEARER).
 # Helpers derive it from the slug under test so a provider built for another
 # server gets that server's bearer, exactly as the fleet should be configured.
 SERVICE_SECRET = "static-service-token-for-verify-deployed"
 SERVICE_TOKEN = f"{SLUG}.{SERVICE_SECRET}"
-# What quorum and ob3 have set today: no slug, no structure. Accepted with a
-# boot warning unless MCP_REQUIRE_BOUND_BEARER is on.
+# What quorum and ob3 have set today: no slug, no structure. Refused at boot
+# unless the retrofit escape hatch MCP_REQUIRE_BOUND_BEARER=false is set.
 UNBOUND_SERVICE_TOKEN = "one-bearer-set-on-every-do-app"
 _DERIVE_SERVICE_TOKEN = object()  # sentinel: "whatever suits this slug"
 
@@ -151,7 +151,7 @@ def make_settings(
     slug: str | None = SLUG,
     okta: bool = True,
     tool_gating: bool = False,
-    require_bound_bearer: bool = False,
+    require_bound_bearer: bool = True,
     accept_legacy_tokens: bool = False,
 ) -> Settings:
     if service_token is _DERIVE_SERVICE_TOKEN:

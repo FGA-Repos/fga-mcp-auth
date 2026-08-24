@@ -19,6 +19,19 @@ a VALIDATED redirect_uri for the request:
 The `error` code is drawn from a fixed set and the description is our own prose.
 Okta's error text never travels — not into the page (phishing on our origin) and
 not into the redirect either.
+
+FLAGGED BEHAVIOR CHANGE (needs Jacob's sign-off, like D4): both live servers
+answer EVERY callback rejection on their own origin — quorum's oauth.py renders
+HTML 400/403/500, ob3's does the same — and quorum's suite pins "a callback
+rejection never 302s" as a security property. Redirecting instead is not a
+superset of that, so it is called out here, in the README's deliberate-changes
+section, and in both retrofit PR bodies rather than being defended only in a
+docstring. What it buys: claude.ai used to spin forever on a denial. What it
+costs: the reason now reaches the user only as one of our fixed descriptions
+(constants.REDIRECT_ERRORS, chosen by AuthzDenied.code) and otherwise only the
+log, and any runbook watching for 403/500 on this route sees 302s. It is not
+exploitable — the target passed the allowlist at DCR and again at /authorize,
+and every code and description is from our own table.
 """
 
 from __future__ import annotations
@@ -30,7 +43,12 @@ from typing import TYPE_CHECKING
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from .constants import ERROR_REASON_FALLBACK, ERROR_REASONS, REDIRECT_ERRORS
+from .constants import (
+    ERROR_REASON_FALLBACK,
+    ERROR_REASONS,
+    REDIRECT_ERROR_CODES,
+    REDIRECT_ERRORS,
+)
 from .okta import AuthzDenied
 from .urls import append_params
 
@@ -97,10 +115,14 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
         provider._okta.check_authorized(claims)
     except AuthzDenied as exc:
         logger.warning("Login denied: %s", exc, extra={"event_category": "auth.failure"})
-        # The group/domain gate. `access_denied` is what tells claude.ai the
-        # human was refused rather than the server broken, and the reason stays
-        # in the log — a denial message is not the client's to render.
-        return fail("access_denied")
+        # The group/domain gate. The wire code is `access_denied` either way —
+        # that is what tells claude.ai the human was refused rather than the
+        # server broken — but the description is picked from our table by which
+        # gate refused, so the user gets the next step (join the group / use
+        # your FGA email) that quorum's on-origin 403 page used to give them.
+        # The gate's own message stays in the log; it is not the client's to
+        # render.
+        return fail(getattr(exc, "code", "account_not_permitted"))
     except Exception:
         logger.exception("Okta callback failed")
         return fail("server_error")
@@ -129,11 +151,17 @@ def error_redirect(pending: dict, error: str) -> Response:
 
     `error` must be a key of REDIRECT_ERRORS: the code and the description both
     come from our own table, so nothing an attacker (or Okta) chose is echoed to
-    the client. `state` is the client's own value and is returned unchanged, as
-    the RFC requires — a client that cannot match the response to its request
-    has to treat it as unsolicited.
+    the client. Keys that name a specific denial map to the RFC code they are a
+    flavour of (REDIRECT_ERROR_CODES), so the vocabulary on the wire stays the
+    one claude.ai parses while the description can still be actionable. `state`
+    is the client's own value and is returned unchanged, as the RFC requires — a
+    client that cannot match the response to its request has to treat it as
+    unsolicited.
     """
-    out = {"error": error, "error_description": REDIRECT_ERRORS[error]}
+    out = {
+        "error": REDIRECT_ERROR_CODES.get(error, error),
+        "error_description": REDIRECT_ERRORS[error],
+    }
     if pending.get("original_state"):
         out["state"] = pending["original_state"]
     return RedirectResponse(url=append_params(pending["redirect_uri"], out), status_code=302)

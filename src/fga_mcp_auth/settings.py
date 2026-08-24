@@ -118,22 +118,28 @@ class Settings(BaseSettings):
     # Static service token for socialbot, curl and CI. Optional: unset means the
     # service path simply does not exist. It is never a bypass of anything.
     #
-    # SHOULD be `<MCP_SERVER_SLUG>.<random>`. The bearer is an opaque string with
+    # MUST be `<MCP_SERVER_SLUG>.<random>`. The bearer is an opaque string with
     # no claims to check, so a slug prefix is the service path's only audience
     # binding — without it, one value pasted across all seven DO apps replays at
     # every one of them (a leaked congress bearer opening teamtailor's PII
-    # tools). An unprefixed value logs a loud warning at boot and keeps working;
-    # MCP_REQUIRE_BOUND_BEARER=true turns that warning into a refusal to boot.
+    # tools).
     bearer_token: SecretStr | None = Field(default=None, validation_alias="MCP_BEARER_TOKEN")
 
-    # Enforce the slug prefix above. Default OFF in v1.0.0 on purpose: quorum and
-    # ob3 are LIVE with unprefixed bearers, and socialbot holds those values, so
-    # a hard requirement would make the retrofit deploy a three-place credential
-    # rotation (DO env, socialbot config, scripts) with a socialbot outage in the
-    # gap. Flip it on per server once the bearer has been re-issued — that is a
-    # deliberate operational step, not something this package decides for the
-    # fleet. FLAGGED FOR JACOB: fleet-wide default-on is the end state.
-    require_bound_bearer: bool = Field(default=False, validation_alias="MCP_REQUIRE_BOUND_BEARER")
+    # Enforce the slug prefix above. Default ON, matching MCP_ACCEPT_LEGACY_TOKENS:
+    # the secure configuration is what you get by not thinking about it, and the
+    # unsafe one has to be typed out. `aud` makes cross-server replay of a USER
+    # token impossible; without this the same claim did not hold for the service
+    # path, which grants strictly more (unrestricted at the group gate, never
+    # expires).
+    #
+    # `MCP_REQUIRE_BOUND_BEARER=false` is the retrofit escape hatch, and only the
+    # two live servers need it: quorum and ob3 run unprefixed bearers that
+    # socialbot also holds, so requiring the prefix on their first deploy would
+    # be a three-place credential rotation (DO env, socialbot config, scripts)
+    # with a socialbot outage in the gap. Set it false for that deploy, re-issue
+    # the bearer as `<slug>.<random>`, then delete the variable. The five
+    # password-era servers get a prefixed bearer from the start and never set it.
+    require_bound_bearer: bool = Field(default=True, validation_alias="MCP_REQUIRE_BOUND_BEARER")
 
     # Transition switch for the retrofit of the two LIVE servers. Tokens minted
     # before this package carry neither `aud` nor `v`, both of which are normally

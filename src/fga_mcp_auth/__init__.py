@@ -34,6 +34,7 @@ __version__ = "1.0.0"
 _LAZY = {
     "wire_sdk1": ("fga_mcp_auth.wiring.sdk1", "wire_sdk1"),
     "auth_kwargs": ("fga_mcp_auth.wiring.sdk2", "auth_kwargs"),
+    "build_http_app": ("fga_mcp_auth.wiring.sdk2", "build_http_app"),
     "register_auth_routes": ("fga_mcp_auth.wiring.sdk2", "register_auth_routes"),
     "audit_middleware": ("fga_mcp_auth.wiring.sdk2", "audit_middleware"),
 }
@@ -69,6 +70,7 @@ __all__ = [
     "__version__",
     "audit_middleware",
     "auth_kwargs",
+    "build_http_app",
     "is_allowed_redirect",
     "register_auth_routes",
     "sdk_major",

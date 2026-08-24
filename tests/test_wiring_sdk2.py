@@ -6,6 +6,8 @@ so this file is new. Skipped on the 1.x leg of the matrix.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from conftest import HOST, REQUIRED_ENV, SDK_MAJOR, SERVICE_TOKEN, make_settings
 
@@ -33,16 +35,12 @@ def wired(monkeypatch):
 
 @pytest.fixture
 def app(wired):
-    from mcp.server.transport_security import TransportSecuritySettings
+    """Built the way a consumer is told to build it, so the tests exercise the
+    transport security the package supplies rather than one the test wrote."""
+    from fga_mcp_auth import build_http_app
 
     mcp, _provider, _kwargs = wired
-    return mcp.streamable_http_app(
-        json_response=True,
-        stateless_http=True,
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=True, allowed_hosts=[HOST]
-        ),
-    )
+    return build_http_app(mcp, Settings(), json_response=True, stateless_http=True)
 
 
 def _routes(app) -> dict[str, set[str]]:
@@ -94,7 +92,7 @@ class TestHttpAppWiring:
     def test_a_custom_token_route_cannot_shadow_the_sdk_one(self, wired):
         """The 2.0 half of the EMA mounting note in grants.py: same ordering,
         so `custom_route("/token")` is dead code here too."""
-        from mcp.server.transport_security import TransportSecuritySettings
+        from fga_mcp_auth import build_http_app
 
         mcp, _provider, _kwargs = wired
 
@@ -102,16 +100,83 @@ class TestHttpAppWiring:
         async def _shadow_token(request):  # pragma: no cover - never reached
             raise AssertionError("the SDK's /token should have matched first")
 
-        app = mcp.streamable_http_app(
-            json_response=True,
-            stateless_http=True,
-            transport_security=TransportSecuritySettings(
-                enable_dns_rebinding_protection=True, allowed_hosts=[HOST]
-            ),
-        )
+        app = build_http_app(mcp, Settings(), json_response=True, stateless_http=True)
         routes = [r for r in app.routes if r.path == "/token"]
         assert len(routes) == 2, "expected the SDK's /token and ours to coexist"
         assert getattr(routes[0].endpoint, "__name__", "") != "_shadow_token"
+
+
+class TestTransportSecurity:
+    """DNS-rebinding / Host-header protection, which fga-ob3-mcp passes live.
+
+    On SDK 2.0 it is a `streamable_http_app()` kwarg, not a constructor one, so
+    it is the one piece of wire_sdk1's job that `auth_kwargs` structurally cannot
+    do. Before `build_http_app` existed, a consumer following the README recipe
+    dropped it silently and every test stayed green — which is exactly how it
+    would have gone missing from ob3 at the retrofit.
+    """
+
+    def test_build_http_app_keys_protection_on_the_public_host(self, wired):
+        from fga_mcp_auth import build_http_app
+
+        mcp, _provider, _kwargs = wired
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return "app"
+
+        mcp.streamable_http_app = _capture
+        build_http_app(mcp, Settings(), json_response=True)
+        security = captured["transport_security"]
+        assert security.enable_dns_rebinding_protection is True
+        assert security.allowed_hosts == [HOST]
+        assert captured["json_response"] is True
+
+    def test_a_foreign_host_header_is_refused(self, app):
+        """The protection doing its job end to end, not just being configured."""
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            resp = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Authorization": f"Bearer {SERVICE_TOKEN}",
+                    "Host": "evil.example",
+                },
+            )
+        # 421 Misdirected Request is what the SDK's Host check answers with; a
+        # plain 400 would do. What must never happen is 200.
+        assert resp.status_code in (400, 421), resp.status_code
+
+    def test_an_explicit_transport_security_wins(self, wired):
+        """A consumer fronting the DO app with a vanity domain still owns the
+        host list; the package only supplies the default."""
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        from fga_mcp_auth import build_http_app
+
+        mcp, _provider, _kwargs = wired
+        captured = {}
+        mcp.streamable_http_app = lambda **kw: captured.update(kw)
+        mine = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True, allowed_hosts=[HOST, "mcp.thefga.org"]
+        )
+        build_http_app(mcp, Settings(), transport_security=mine)
+        assert captured["transport_security"] is mine
+
+    def test_local_dev_without_a_public_host_does_not_lock_itself_out(self):
+        """MCP_ALLOWED_HOST is boot-required for HTTP, so this is the stdio /
+        local-dev shape only — it must not produce an empty allowlist WITH
+        protection on, which refuses every request."""
+        from fga_mcp_auth import build_http_app
+
+        captured = {}
+        mcp = SimpleNamespace(streamable_http_app=lambda **kw: captured.update(kw))
+        build_http_app(mcp, make_settings(host=None))
+        assert captured["transport_security"].enable_dns_rebinding_protection is False
 
 
 class TestUnauthenticatedRequests:

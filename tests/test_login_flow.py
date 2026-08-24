@@ -372,7 +372,7 @@ class TestErrorsReachTheOAuthClient:
             resp, _ = await run_callback(provider, state)
         assert "email domain is not permitted" in caplog.text
         assert "email domain is not permitted" not in resp.headers["location"]
-        assert redirect_params(resp)["error_description"] == REDIRECT_ERRORS["access_denied"]
+        assert redirect_params(resp)["error_description"] == REDIRECT_ERRORS["wrong_email_domain"]
 
     async def test_error_redirect_omits_state_when_the_client_sent_none(self):
         provider = make_provider()
@@ -408,6 +408,65 @@ class TestErrorsReachTheOAuthClient:
         )
         assert target == f"{BASE}/oauth/error?reason=redirect_not_allowed"
         assert HOSTILE not in target
+
+
+class TestDenialsStayActionable:
+    """The cost of delivering errors to the client instead of an on-origin page:
+    quorum's 403 told the user WHY ("...not in a group permitted...", "add a
+    groups claim") and a bare `access_denied` bounced into claude.ai does not.
+    Nothing the gate wrote may travel, so OUR fixed descriptions have to carry
+    the next step themselves — otherwise every denial becomes an IT ticket that
+    the old on-origin page answered by itself.
+    """
+
+    async def test_a_group_denial_tells_the_user_to_ask_for_the_group(self):
+        provider = make_provider(allowed_groups=frozenset({"MCP Admins"}))
+        _client, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state)
+        q = redirect_params(resp)
+        assert q["error"] == "access_denied"
+        assert q["error_description"] == REDIRECT_ERRORS["account_not_permitted"]
+        assert "Okta group" in q["error_description"]
+
+    async def test_a_domain_denial_tells_the_user_which_account_to_use(self):
+        provider = make_provider(allowed_email_domains=frozenset({"allowed.example"}))
+        _client, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state)
+        q = redirect_params(resp)
+        assert q["error"] == "access_denied"
+        assert "FGA email" in q["error_description"]
+
+    def test_the_two_denials_do_not_read_the_same(self):
+        """If they did, splitting them would be theatre."""
+        assert REDIRECT_ERRORS["account_not_permitted"] != REDIRECT_ERRORS["wrong_email_domain"]
+
+    async def test_the_wire_code_is_always_rfc6749_vocabulary(self):
+        """Our table has more keys than OAuth has codes. claude.ai parses the
+        code, so only `access_denied` / `server_error` may travel on it — the
+        extra keys are descriptions of an access_denied, not new codes."""
+        from fga_mcp_auth.constants import RFC6749_ERROR_CODES
+
+        for gate in (
+            {"allowed_groups": frozenset({"MCP Admins"})},
+            {"allowed_email_domains": frozenset({"allowed.example"})},
+        ):
+            provider = make_provider(**gate)
+            _client, state = await start_login(provider)
+            resp, _ = await run_callback(provider, state)
+            assert redirect_params(resp)["error"] in RFC6749_ERROR_CODES
+
+    async def test_okta_side_failures_stay_generic(self):
+        """A group denial is the user's problem to fix; a failed token exchange
+        is not, and must not be dressed up as one. Both raise AuthzDenied, so
+        its DEFAULT code has to stay the generic sentence — only the two gates
+        in check_authorized opt into the actionable prose."""
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state, token_status=400, token_body={})
+        q = redirect_params(resp)
+        assert q["error"] == "access_denied"
+        assert q["error_description"] == REDIRECT_ERRORS["access_denied"]
+        assert "Okta group" not in q["error_description"]
 
 
 class TestAuthCodeIdentityFailsClosed:

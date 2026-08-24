@@ -94,6 +94,10 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
         self._audience = settings.audience
         self._service_token = settings.service_token_value()
         self._require_bound_service_token()
+        # One-shot latch so the "a legacy token was actually used" warning below
+        # cannot become one log line per MCP request.
+        self._warned_legacy = False
+        self._warn_legacy_window()
 
         okta_cfg = settings.okta
         self._okta = (
@@ -129,12 +133,18 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
         it impossible: the token teamtailor accepts cannot be a token congress
         also accepts.
 
-        Enforcement is OPT-IN in v1.0.0, and that is a deployment fact, not
-        timidity: quorum and ob3 are live with unprefixed bearers that socialbot
-        also holds, so requiring the prefix turns their retrofit into a
-        three-place credential rotation with a socialbot outage in the gap —
-        precisely the regression the plan's T1 gate exists to prevent. Unbound
-        warns; the operator re-issues the bearer and flips the switch.
+        Enforcement is ON by default, so the fleet cannot drift into the shared
+        bearer by inattention — the plan's "cross-server replay is impossible
+        even with identical secrets" has to cover the path that grants MORE than
+        a user token does, not just the JWT one.
+
+        Opting OUT (MCP_REQUIRE_BOUND_BEARER=false) is a deployment fact rather
+        than a mode: quorum and ob3 are live with unprefixed bearers that
+        socialbot also holds, so requiring the prefix on their retrofit deploy
+        would be a three-place credential rotation with a socialbot outage in
+        the gap — precisely the regression the plan's T1 gate exists to prevent.
+        Those two deploys set it false, re-issue the bearer, then drop the
+        variable. Unbound still boots there; it just says so, loudly.
 
         One shape is always fatal, switch or no switch: a bearer that IS the
         prefix and nothing else. That is never a deliberate choice, it is a
@@ -165,11 +175,35 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
                 "bearer cannot be bound to a server at all. " + detail
             )
         if self.settings.require_bound_bearer:
-            raise ValueError(detail + " (MCP_REQUIRE_BOUND_BEARER is on.)")
+            raise ValueError(
+                detail + " (Binding is required by default; MCP_REQUIRE_BOUND_BEARER=false "
+                "is the retrofit-only escape hatch.)"
+            )
         logger.warning(
-            "%s Set MCP_REQUIRE_BOUND_BEARER=true once every caller holds the new value.",
+            "%s MCP_REQUIRE_BOUND_BEARER is off — remove that override once every caller "
+            "holds the new value.",
             detail,
             extra={"event_category": "auth.config.warning"},
+        )
+
+    def _warn_legacy_window(self) -> None:
+        """Say out loud that the transition window is open.
+
+        MCP_ACCEPT_LEGACY_TOKENS is a deploy-window switch, not a mode: while it
+        is on, a token with no `aud` is accepted, so the cross-server barrier is
+        down for pre-package tokens. Left on, it silently stays down forever.
+        Announcing it at boot — and again the first time one is actually used —
+        is what makes "turn it off inside the refresh window" an observable step
+        rather than a line in a PR body nobody re-reads.
+        """
+        if not self.settings.accept_legacy_tokens:
+            return
+        logger.warning(
+            "MCP_ACCEPT_LEGACY_TOKENS is ON: tokens minted before this package (no 'aud', "
+            "no 'v') are accepted as format v1, so the cross-server replay barrier is down "
+            "for them. This is a retrofit deploy window only — turn it off within the "
+            "7-day refresh TTL, by which point every live session has re-minted itself.",
+            extra={"event_category": "auth.config.warning", "server": self._audience},
         )
 
     # --- our own token format ---------------------------------------------
@@ -199,7 +233,7 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
 
     def _verify(self, token: str, kind: str) -> dict | None:
         """May raise InvalidTokenFormat; callers decide 401 vs invalid_grant."""
-        return tokens.verify(
+        claims = tokens.verify(
             token,
             secret=self._secret,
             issuer=self._issuer,
@@ -207,6 +241,17 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
             kind=kind,
             accept_legacy=self.settings.accept_legacy_tokens,
         )
+        if claims is not None and "aud" not in claims and not self._warned_legacy:
+            # Only reachable with accept_legacy on. Once per process: enough to
+            # prove the window is still doing something, quiet enough to leave in.
+            self._warned_legacy = True
+            logger.warning(
+                "Accepted a pre-package token with no 'aud' claim (MCP_ACCEPT_LEGACY_TOKENS). "
+                "Sessions from before the retrofit are still live; the switch can come off "
+                "once this stops appearing.",
+                extra={"event_category": "auth.legacy.accepted", "server": self._audience},
+            )
+        return claims
 
     def _prune(self) -> None:
         now = time.time()

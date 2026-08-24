@@ -18,6 +18,7 @@ any server's response redaction, which is data shaping and a separate concern.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -67,12 +68,27 @@ class GroupGate:
             if not self.enabled:
                 return func
 
-            @functools.wraps(func)
-            async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                self._check(func.__name__, groups)
-                return await func(*args, **kwargs)
+            # Sync tools are first-class in both SDK lines (`def get_candidate`
+            # is as valid as `async def`), and an unconditionally async wrapper
+            # would `await` a plain return value: TypeError on every PERMITTED
+            # call, while denials kept working. Turning gating on would then
+            # take the gated tools down for exactly the users allowed to use
+            # them. The check itself is sync, so both shapes are one line.
+            if inspect.iscoroutinefunction(func):
 
-            return wrapper  # type: ignore[return-value]
+                @functools.wraps(func)
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    self._check(func.__name__, groups)
+                    return await func(*args, **kwargs)
+
+                return async_wrapper  # type: ignore[return-value]
+
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                self._check(func.__name__, groups)
+                return func(*args, **kwargs)
+
+            return sync_wrapper  # type: ignore[return-value]
 
         return decorate
 

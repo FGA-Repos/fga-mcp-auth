@@ -1,15 +1,26 @@
 """Wiring for the MCP SDK 2.0 line (`mcp.server.MCPServer`).
 
-    from fga_mcp_auth import Settings, auth_kwargs, register_auth_routes, audit_middleware
+    from fga_mcp_auth import (
+        Settings, auth_kwargs, register_auth_routes, audit_middleware, build_http_app,
+    )
 
     settings = Settings()
     provider, kwargs = auth_kwargs(settings)
     mcp = MCPServer(name="fga-ob3", middleware=[audit_middleware(settings)], **kwargs)
     register_auth_routes(mcp, provider)
+    app = build_http_app(mcp, settings, json_response=True, stateless_http=True)
 
 2.0 takes auth via constructor kwargs and REJECTS being handed both an
 `auth_server_provider` and a `token_verifier` (1.x required both), so
 `auth_kwargs` never returns a verifier.
+
+Build the ASGI app with `build_http_app`, not `mcp.streamable_http_app()`
+directly. DNS-rebinding / Host-header protection is a `streamable_http_app`
+kwarg on this SDK line, not a constructor one, so it is the single piece of the
+1.x helper's job that cannot live in `auth_kwargs` — and fga-ob3-mcp passes it
+today. A consumer that follows the wiring recipe and calls the SDK method itself
+drops that protection with every test still green, which is exactly how it would
+go missing.
 """
 
 from __future__ import annotations
@@ -83,6 +94,27 @@ def register_auth_routes(mcp: Any, provider: FGAAuthProvider) -> None:
     @mcp.custom_route("/oauth/error", methods=["GET"])
     async def _oauth_error(request):
         return provider.handle_oauth_error(request)
+
+
+def build_http_app(mcp: Any, settings: Settings, **kwargs: Any) -> Any:
+    """`mcp.streamable_http_app()` with transport security already attached.
+
+    Symmetric with wire_sdk1, which sets `mcp.settings.transport_security` for
+    the 1.x consumer. Everything else passes straight through, and an explicit
+    `transport_security=` wins — a consumer with extra hostnames (a vanity
+    domain in front of the DO app) still owns that decision.
+    """
+    require_sdk2()
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    kwargs.setdefault(
+        "transport_security",
+        TransportSecuritySettings(
+            enable_dns_rebinding_protection=bool(settings.allowed_host),
+            allowed_hosts=[settings.allowed_host] if settings.allowed_host else [],
+        ),
+    )
+    return mcp.streamable_http_app(**kwargs)
 
 
 def audit_middleware(settings: Settings) -> AuditMiddleware:

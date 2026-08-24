@@ -37,7 +37,21 @@ logger = logging.getLogger(__name__)
 
 
 class AuthzDenied(Exception):
-    """Authenticated with Okta, but not permitted to use this server."""
+    """Authenticated with Okta, but not permitted to use this server.
+
+    `code` selects which fixed description the OAuth client is sent (see
+    constants.REDIRECT_ERRORS). The exception's own message never travels — it
+    is for the log — but the gate that refused does decide which of OUR
+    sentences the user sees, because "ask IT for the group" and "use your FGA
+    email" are different next steps and the on-origin page that used to say so
+    is gone. The default stays generic on purpose: a failed token exchange or a
+    nonce mismatch is this class too, and telling that user to ask for an Okta
+    group would send them somewhere that cannot help.
+    """
+
+    def __init__(self, message: str, code: str = "access_denied") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class OktaOIDC:
@@ -147,10 +161,14 @@ class OktaOIDC:
             # misconfigured Okta app into an open door.
             raise AuthzDenied(
                 "This server requires Okta group membership, but the id_token carried "
-                "no 'groups' claim. Add a groups claim to the Okta OIDC app."
+                "no 'groups' claim. Add a groups claim to the Okta OIDC app.",
+                code="account_not_permitted",
             )
         if not allowed.intersection(groups):
-            raise AuthzDenied("Your Okta account is not in a group permitted to use this server.")
+            raise AuthzDenied(
+                "Your Okta account is not in a group permitted to use this server.",
+                code="account_not_permitted",
+            )
 
     def _check_email_domain(self, claims: dict[str, Any]) -> None:
         allowed = self.cfg.allowed_email_domains
@@ -160,7 +178,11 @@ class OktaOIDC:
         if not isinstance(email, str) or "@" not in email:
             raise AuthzDenied(
                 "This server restricts sign-in by email domain, but the id_token "
-                "carried no usable 'email' claim."
+                "carried no usable 'email' claim.",
+                code="wrong_email_domain",
             )
         if email.rsplit("@", 1)[1].lower() not in allowed:
-            raise AuthzDenied("Your email domain is not permitted to use this server.")
+            raise AuthzDenied(
+                "Your email domain is not permitted to use this server.",
+                code="wrong_email_domain",
+            )

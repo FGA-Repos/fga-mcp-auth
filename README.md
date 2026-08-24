@@ -85,8 +85,13 @@ both) and returns the provider if you want it.
 
 ```python
 from mcp.server import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
-from fga_mcp_auth import Settings, audit_middleware, auth_kwargs, register_auth_routes
+from fga_mcp_auth import (
+    Settings,
+    audit_middleware,
+    auth_kwargs,
+    build_http_app,
+    register_auth_routes,
+)
 
 settings = Settings()
 kwargs = {"name": "fga-ob3", "instructions": ..., "lifespan": lifespan}
@@ -98,19 +103,19 @@ if cfg.transport == "http":
 else:
     mcp = MCPServer(**kwargs)
 
-app = mcp.streamable_http_app(
-    json_response=True,
-    stateless_http=True,
-    host=cfg.host,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=bool(cfg.allowed_host),
-        allowed_hosts=[cfg.allowed_host] if cfg.allowed_host else [],
-    ),
-)
+app = build_http_app(mcp, settings, json_response=True, stateless_http=True, host=cfg.host)
 ```
 
 `auth_kwargs` never returns a `token_verifier`: SDK 2.0 rejects being handed
 both that and an `auth_server_provider`.
+
+**Use `build_http_app`, not `mcp.streamable_http_app()`.** On this SDK line
+DNS-rebinding / Host-header protection is an argument to the app builder, not to
+the constructor, so it is the one part of the 1.x helper's job that `auth_kwargs`
+structurally cannot do — and a consumer that calls the SDK method directly drops
+that protection with every test still passing. Everything else passes straight
+through, and an explicit `transport_security=` still wins if a server fronts the
+DO app with extra hostnames.
 
 Calling the wrong helper for the installed SDK raises `SdkMismatch` naming the
 right one.
@@ -125,11 +130,18 @@ gate = GroupGate(settings)
 @mcp.tool()
 @gate.require("MCP Teamtailor Users")
 async def get_candidate(...): ...
+
+@mcp.tool()
+@gate.require("MCP Teamtailor Users")
+def list_candidates(...): ...   # sync tools are gated the same way
 ```
 
 With `MCP_TOOL_GATING` unset the decorator returns the function **unwrapped** —
-no runtime cost and no behavior change. Turning it on takes two coordinated
-steps, in this order:
+no runtime cost and no behavior change. With it on, `async def` and `def` tools
+are both wrapped in their own shape, so the SDK still sees the kind of callable
+it was given.
+
+Turning it on takes two coordinated steps, in this order:
 
 1. Add a `groups` claim to the shared Okta OIDC app. **It has none today.**
 2. Set `MCP_TOOL_GATING=true` on the server.
@@ -152,8 +164,8 @@ future change.
 | `OKTA_ISSUER` | **yes** | Org authorization server URL, e.g. `https://example.okta.com`. Endpoints come from its discovery document, never hardcoded. |
 | `OKTA_CLIENT_ID` | **yes** | The shared FGA OIDC app. |
 | `OKTA_CLIENT_SECRET` | **yes** | Used with `client_secret_basic` at the token exchange. |
-| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Should be `<MCP_SERVER_SLUG>.<random>`** — anything else boots with a loud warning (see `MCP_REQUIRE_BOUND_BEARER`). A value of exactly `<slug>.` is always fatal. |
-| `MCP_REQUIRE_BOUND_BEARER` | no | `true` turns that warning into a refusal to boot. Default off, so the retrofit does not force a same-minute bearer rotation. Flip it on per server once every caller holds the new value. |
+| `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Must be `<MCP_SERVER_SLUG>.<random>`** — anything else refuses to boot (see `MCP_REQUIRE_BOUND_BEARER`). A value of exactly `<slug>.` is always fatal. |
+| `MCP_REQUIRE_BOUND_BEARER` | no | **Default on.** `false` downgrades the refusal above to a boot warning — the retrofit-only escape hatch for quorum and ob3, whose live unprefixed bearers socialbot also holds. Set it for that deploy, re-issue the bearer, then delete the variable. Nothing else should ever set it. |
 | `MCP_ACCEPT_LEGACY_TOKENS` | no | `true` accepts pre-package tokens (no `aud`, no `v`) as format v1, for a silent retrofit cutover. Default off. Turn it back off inside the 7-day refresh window. |
 | `OKTA_ALLOWED_GROUPS` | no | CSV. Server-wide login gate. Empty = any authenticated Okta user. **Non-empty with no groups claim on the app = everyone denied.** |
 | `OKTA_ALLOWED_EMAIL_DOMAINS` | no | CSV. Second login gate, checked beside groups. Empty = inert. |
@@ -180,10 +192,11 @@ Consumer-owned and untouched by this package: `MCP_TRANSPORT`, `MCP_HOST`,
 | — | `OKTA_CLIENT_SECRET` **(new)** |
 | — | `OKTA_ALLOWED_GROUPS`, `OKTA_ALLOWED_EMAIL_DOMAINS`, `MCP_TOOL_GATING` (optional) |
 
-For `fga-quorum-mcp` and `fga-ob3-mcp`, every name already matches and only
-`MCP_SERVER_SLUG` is new, so the retrofit deploy needs **no credential
-rotation**: today's unprefixed `MCP_BEARER_TOKEN` keeps working (with a boot
-warning) and socialbot is untouched.
+For `fga-quorum-mcp` and `fga-ob3-mcp`, every name already matches and two vars
+are new: `MCP_SERVER_SLUG`, plus `MCP_REQUIRE_BOUND_BEARER=false` for the deploy
+window. With that flag set the retrofit needs **no credential rotation**:
+today's unprefixed `MCP_BEARER_TOKEN` keeps working (with a boot warning) and
+socialbot is untouched. Without it the server refuses to start.
 
 Re-issuing the bearer is a **separate, later step**, and it is a three-place
 change — do all three inside one window:
@@ -191,11 +204,11 @@ change — do all three inside one window:
 1. `MCP_BEARER_TOKEN` on the DO app → `<slug>.<random>`
 2. socialbot's config → the same value
 3. any script / CI job / saved curl that holds the old one
-4. then set `MCP_REQUIRE_BOUND_BEARER=true` so the old value can never come back
+4. then **delete** `MCP_REQUIRE_BOUND_BEARER` so the old value can never come back
 
 Skipping (2) is a socialbot outage: every tool call 401s until its config
-catches up. The five password-era servers have no such history, so they should
-be issued a prefixed bearer and `MCP_REQUIRE_BOUND_BEARER=true` from the start.
+catches up. The five password-era servers have no such history, so they are
+issued a prefixed bearer from the start and never set the flag at all.
 
 Each server also needs its Okta redirect URI registered on the shared app:
 `https://<app>.ondigitalocean.app/okta/callback`.
@@ -209,10 +222,13 @@ Each server also needs its Okta redirect URI registered on the shared app:
   a JWT, so it cannot carry `aud` — and it grants *more* than a user token
   (never expires, unrestricted at the group gate). A `<MCP_SERVER_SLUG>.<random>`
   value is what stops one shared bearer from opening every server: the value
-  teamtailor accepts cannot be a value congress also accepts. Unbound values
-  boot with a warning so the live servers can be retrofitted without a
-  synchronized rotation; `MCP_REQUIRE_BOUND_BEARER=true` closes the door once
-  they have been re-issued. Distinct random half per server as well.
+  teamtailor accepts cannot be a value congress also accepts. **Required by
+  default** — "cross-server replay is impossible even with identical secrets"
+  has to cover the path that grants *more* than a user token, not only the JWT
+  one, and a binding that shipped default-off is one an admin never meets.
+  `MCP_REQUIRE_BOUND_BEARER=false` exists only so the two live servers can be
+  retrofitted without a synchronized rotation. Distinct random half per server
+  as well.
 * **`MCP_ALLOWED_HOST` is load-bearing.** Unset, `public_base_url` falls back to
   `http://localhost:8080` — the same string on every FGA MCP server. That is why
   it is boot-required, and why `aud` exists on top of it.
@@ -290,6 +306,27 @@ deploy-timing decision for Jacob rather than an implementation detail.
 `TestLegacyTokenRejection` pins the default failure shape and
 `TestLegacyTransitionWindow` pins what the switch does and does not loosen.
 
+## Deliberate behavior changes vs. live quorum and ob3 — FLAGGED
+
+Everything else in this package is the safer of the two live implementations.
+These five are **not supersets** of what is running today, so they are listed
+here to be copied into each retrofit PR body and signed off, rather than
+discovered at deploy time.
+
+| # | Change | Who it affects | What it costs |
+|---|---|---|---|
+| 1 | **Callback failures 302 to the client** instead of rendering HTML 400/403/500 on our origin. Every rejection path: Okta `error`, RFC 9207 `iss` mismatch, missing `code`, group/domain denial, unexpected exception. | Both live servers. Quorum's suite pinned "a callback rejection never 302s" as a security property; that test is replaced. | claude.ai stops spinning forever on a denial (the reason it changed). The user now sees one of *our* fixed descriptions instead of the on-origin page, and a runbook watching for 403/500 on `/okta/callback` sees 302s. The denial reason itself stays in the log. A missing `code` also consumes the pending state where quorum left it retryable. |
+| 2 | **`aud` and `v` are required claims**, so pre-package tokens are rejected. | Both live servers, at the first deploy. | A synchronized reconnect card for every connected staff member, unless the deploy sets `MCP_ACCEPT_LEGACY_TOKENS=true` — see the section above. |
+| 3 | **The service bearer must be slug-bound.** | Both live servers, which run unprefixed bearers. | Their retrofit deploy must set `MCP_REQUIRE_BOUND_BEARER=false`, or the server will not boot. |
+| 4 | **Fail-loud startup**: missing Okta config refuses to boot. | ob3, which could boot with SSO silently disabled. | Nothing, if the env is complete. That is the point. |
+| 5 | **Revocation is advertised as disabled** (`RevocationOptions(enabled=False)`). | Both. | `/revoke` disappears. It never revoked anything — stateless tokens — so it returned 200 while the token kept working. |
+
+Denial messages are the mitigation for (1): the fixed `error_description` for a
+group denial says to ask for the Okta group, and for a domain denial says to use
+an FGA account, so the actionable half of quorum's 403 page survives the bounce.
+The wire `error` stays RFC 6749 vocabulary (`access_denied` / `server_error`),
+which is all claude.ai parses.
+
 ## Release and pinning policy
 
 * Consumers **pin the full commit SHA**, in a tarball URL, with a comment naming
@@ -323,11 +360,11 @@ safer of the two everywhere they differed, plus:
   `iss`.
 * **New — token format version (`v`).** Unrecognized versions degrade to
   `invalid_grant` instead of an exception.
-* **New — the service bearer can be slug-bound.** `<MCP_SERVER_SLUG>.<random>`
-  stops one bearer being shared across the fleet. Warned about by default and
-  enforced by `MCP_REQUIRE_BOUND_BEARER`, so today's live values keep working
-  and re-issuing them (with socialbot's config, in the same window) is a
-  separate step rather than a condition of the retrofit deploy.
+* **New — the service bearer is slug-bound.** `<MCP_SERVER_SLUG>.<random>` stops
+  one bearer being shared across the fleet, which `aud` cannot do for an opaque
+  string. Required at boot; `MCP_REQUIRE_BOUND_BEARER=false` is the escape hatch
+  that lets quorum and ob3 retrofit before re-issuing their bearers (a
+  three-place change that includes socialbot's config).
 * **New — `MCP_ACCEPT_LEGACY_TOKENS`**, the transition switch that turns the
   forced reconnect above into a silent cutover. Default off.
 * **Fixed — a refresh token that fails verification** (an expiry crossed between
@@ -341,8 +378,17 @@ safer of the two everywhere they differed, plus:
 * **Fixed — login errors never reached the OAuth client.** A group-gate denial
   or a failed Okta exchange rendered an HTML page on our origin, so claude.ai
   sat waiting on a callback that never came. Failures now redirect to the
-  validated `redirect_uri` with `error` + `state` per RFC 6749 §4.1.2.1.
-  *Behavior change vs. live quorum/ob3, both of which show the dead page.*
+  validated `redirect_uri` with `error` + `state` per RFC 6749 §4.1.2.1, and the
+  fixed `error_description` carries the user's next step (join the Okta group /
+  use your FGA account) that the on-origin page used to give them.
+  *Behavior change vs. live quorum/ob3 — item 1 in the flagged table above.*
+* **Fixed — `GroupGate` on a sync tool.** The wrapper was unconditionally
+  `async`, so with gating on a permitted caller of a plain `def` tool got a
+  `TypeError` while denials worked: turning gating on would have broken the
+  gated tools for exactly the people allowed to use them.
+* **Fixed — the SDK 2.0 wiring dropped transport security.** `build_http_app`
+  now supplies the DNS-rebinding / Host-header protection that `wire_sdk1` sets
+  and that ob3 passes live; nothing prompted a 2.0 consumer to keep it.
 * **New — hardened redirect allowlist.** Exact-host matching for loopback, https
   required for `claude.ai`/`claude.com`, backslashes rejected outright.
 * **Fixed — a signed token with no `client_id`** used to raise `KeyError` and

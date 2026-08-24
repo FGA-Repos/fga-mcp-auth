@@ -256,3 +256,94 @@ class TestToolGroupGate:
 
         assert get_candidate.__name__ == "get_candidate"
         assert get_candidate.__doc__ == "Fetch one candidate."
+
+
+class TestGatedSyncTools:
+    """Sync tools are first-class in both SDK lines, and teamtailor's PII tools
+    are the ones most likely to be gated.
+
+    An unconditionally async wrapper would `await` a plain return value: denials
+    kept working (the check runs first) but every PERMITTED call raised
+    TypeError, so turning gating on would take the gated tools down for exactly
+    the users allowed to use them. Every other test in this file gates an
+    `async def`, which is why that went unnoticed.
+    """
+
+    def test_disabled_gate_returns_a_sync_function_unwrapped(self):
+        gate = GroupGate(make_settings(tool_gating=False))
+
+        def get_candidate():
+            return "pii"
+
+        assert gate.require("HR")(get_candidate) is get_candidate
+
+    def test_a_permitted_caller_gets_the_return_value_not_a_typeerror(self):
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("MCP Teamtailor Users")
+        def get_candidate():
+            return "pii"
+
+        with as_caller(user_token("MCP Teamtailor Users")):
+            assert get_candidate() == "pii"
+
+    def test_the_wrapper_around_a_sync_tool_is_not_a_coroutine_function(self):
+        """What the SDK inspects when it decides how to call the tool."""
+        import inspect
+
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("HR")
+        def get_candidate():
+            return "pii"
+
+        assert not inspect.iscoroutinefunction(get_candidate)
+
+    def test_a_sync_tool_still_denies_a_non_member(self):
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("MCP Teamtailor Users")
+        def get_candidate():
+            return "pii"
+
+        with as_caller(user_token("Everyone")), pytest.raises(ToolError, match="Teamtailor"):
+            get_candidate()
+
+    def test_a_sync_tool_still_denies_when_there_is_no_caller(self):
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("HR")
+        def get_candidate():
+            return "pii"
+
+        with as_caller(None), pytest.raises(ToolError):
+            get_candidate()
+
+    def test_a_sync_tool_keeps_its_arguments_and_metadata(self):
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("HR")
+        def get_candidate(candidate_id: str, *, include_pii: bool = False) -> str:
+            """Fetch one candidate."""
+            return f"{candidate_id}:{include_pii}"
+
+        with as_caller(user_token("HR")):
+            assert get_candidate("42", include_pii=True) == "42:True"
+        assert get_candidate.__name__ == "get_candidate"
+        assert get_candidate.__doc__ == "Fetch one candidate."
+
+    async def test_an_async_tool_is_still_wrapped_as_a_coroutine_function(self):
+        """The other half of the branch: the SDK awaits what it decided is a
+        coroutine function, so the wrapper must not flatten one into a sync
+        callable either."""
+        import inspect
+
+        gate = GroupGate(make_settings(tool_gating=True))
+
+        @gate.require("HR")
+        async def get_candidate():
+            return "pii"
+
+        assert inspect.iscoroutinefunction(get_candidate)
+        with as_caller(user_token("HR")):
+            assert await get_candidate() == "pii"

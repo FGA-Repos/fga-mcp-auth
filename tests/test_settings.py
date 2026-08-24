@@ -68,20 +68,22 @@ class TestConfig:
         assert fallback.public_base_url == "http://localhost:8080"
         assert "quorum" not in fallback.public_base_url
 
-    def test_the_two_operational_switches_default_off(self):
-        """Both change how a LIVE server behaves at deploy time, so neither may
-        be inherited: MCP_REQUIRE_BOUND_BEARER would break socialbot's bearer,
-        MCP_ACCEPT_LEGACY_TOKENS would relax a claim check. Opt in, per server,
-        per deploy."""
+    def test_both_operational_switches_default_to_the_safe_side(self):
+        """Neither may be inherited, and for each the safe side is the one that
+        needs no thought: an unbound service bearer is refused, and a token with
+        no `aud` is refused. Both defaults cost the quorum/ob3 retrofit an
+        explicit override for one deploy window, which is the point — the
+        override is visible in the app spec, and its absence is not a silent
+        weakening of the other five servers."""
         settings = Settings()
-        assert settings.require_bound_bearer is False
+        assert settings.require_bound_bearer is True
         assert settings.accept_legacy_tokens is False
 
     def test_the_two_operational_switches_read_their_env_vars(self, monkeypatch):
-        monkeypatch.setenv("MCP_REQUIRE_BOUND_BEARER", "true")
+        monkeypatch.setenv("MCP_REQUIRE_BOUND_BEARER", "false")
         monkeypatch.setenv("MCP_ACCEPT_LEGACY_TOKENS", "true")
         settings = Settings()
-        assert settings.require_bound_bearer is True
+        assert settings.require_bound_bearer is False
         assert settings.accept_legacy_tokens is True
 
     def test_secrets_are_not_repr_leaked(self):

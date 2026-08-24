@@ -8,6 +8,7 @@ boundary.
 
 from __future__ import annotations
 
+import logging
 import time
 
 import jwt
@@ -429,6 +430,54 @@ class TestLegacyTransitionWindow:
         """The claims that were always required stay required."""
         provider = self.transitional()
         assert await provider.load_access_token(self.legacy(client_id=None)) is None
+
+
+class TestLegacyWindowIsAudible:
+    """The switch's real failure mode is not that it exists — it is that it gets
+    left on.
+
+    While it is on, a token with no `aud` is accepted, so the cross-server
+    barrier is down for pre-package tokens. Nothing expires the flag, and a
+    retrofit PR body is not a monitor. So the server says the window is open at
+    boot, and says it again the first time one is actually used — that second
+    line going quiet is the operator's signal that the flag can come off.
+    """
+
+    @staticmethod
+    def legacy(**claims) -> str:
+        return mint_raw(SECRET, aud=None, v=None, **claims)
+
+    def test_the_open_window_is_announced_at_boot(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            make_provider(accept_legacy_tokens=True)
+        assert "MCP_ACCEPT_LEGACY_TOKENS" in caplog.text
+        assert "7-day" in caplog.text
+
+    def test_a_normal_server_says_nothing(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            make_provider()
+        assert "MCP_ACCEPT_LEGACY_TOKENS" not in caplog.text
+
+    async def test_using_a_legacy_token_is_logged(self, caplog):
+        provider = make_provider(accept_legacy_tokens=True)
+        with caplog.at_level(logging.WARNING):
+            assert await provider.load_access_token(self.legacy()) is not None
+        assert "no 'aud' claim" in caplog.text
+
+    async def test_it_is_logged_once_not_once_per_request(self, caplog):
+        """This runs on every authenticated MCP call; a line each would be
+        unreadable and would get filtered out, which defeats the point."""
+        provider = make_provider(accept_legacy_tokens=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                await provider.load_access_token(self.legacy())
+        assert caplog.text.count("no 'aud' claim") == 1
+
+    async def test_a_modern_token_does_not_trip_it(self, caplog):
+        provider = make_provider(accept_legacy_tokens=True)
+        with caplog.at_level(logging.WARNING):
+            await provider.load_access_token(provider._mint("access", "c", [], USER, 60))
+        assert "no 'aud' claim" not in caplog.text
 
 
 class TestOffboardingWindow:

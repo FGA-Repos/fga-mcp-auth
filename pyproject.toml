@@ -1,0 +1,47 @@
+[project]
+name = "fga-mcp-auth"
+version = "1.0.0"
+description = "FGA's shared Okta OIDC auth layer for MCP servers (SDK 1.x and 2.0)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["mcp", "oauth", "okta", "oidc", "fga"]
+dependencies = [
+    # Spans both SDK lines on purpose; the wiring helpers gate at runtime.
+    "mcp>=1.26.0,<3.0.0",
+    "pyjwt[crypto]>=2.9.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "starlette>=0.37",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.22", "ruff>=0.6"]
+sdk1 = ["mcp[cli]>=1.26.0,<2.0.0"]
+sdk2 = ["mcp[cli]>=2.0.0,<3.0.0"]
+
+[tool.uv]
+# sdk1 and sdk2 pin the same package to disjoint ranges on purpose: the whole
+# point of the package is that it works under both, and the test matrix runs
+# each leg in its own environment.
+conflicts = [[{ group = "sdk1" }, { group = "sdk2" }]]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fga_mcp_auth"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]

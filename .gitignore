@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.venv-sdk1/
+.venv-sdk2/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+*.sqlite
+*.sqlite3
+.DS_Store
+uv.lock

@@ -22,7 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v6
+      # v8+ stopped publishing floating major tags (immutable releases) — pin the exact patch
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.12"          # requires-python is >=3.11; pin so CI can't float
           cache-suffix: ${{ matrix.sdk }} # legs resolve different groups — separate cache keys

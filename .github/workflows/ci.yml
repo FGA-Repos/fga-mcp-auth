@@ -20,9 +20,9 @@ jobs:
       matrix:
         sdk: [sdk1, sdk2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"          # requires-python is >=3.11; pin so CI can't float
           cache-suffix: ${{ matrix.sdk }} # legs resolve different groups — separate cache keys

@@ -47,12 +47,14 @@ from .constants import (
     PENDING_TTL,
     SERVICE_CLIENT_ID,
     SERVICE_TOKEN_SEPARATOR,
+    USER_STATUS_CACHE_TTL,
 )
 from .grants import GrantContext, authorization_code_grant, refresh_token_grant
 from .okta import OktaOIDC
 from .redirects import is_allowed_redirect
 from .settings import Settings
 from .tokens import InvalidTokenFormat
+from .user_status import OktaUserStatus
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +114,10 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
         # state_key -> pending OAuth context awaiting the Okta round-trip
         self._pending: dict[str, dict] = {}
 
-        self._grants = GrantContext(settings=settings, mint=self._mint)
+        self._user_status = self._build_user_status()
+        self._grants = GrantContext(
+            settings=settings, mint=self._mint, user_status=self._user_status
+        )
 
         if self._okta is None:
             logger.warning(
@@ -185,6 +190,43 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
             detail,
             extra={"event_category": "auth.config.warning"},
         )
+
+    def _build_user_status(self) -> OktaUserStatus | None:
+        """Build the refresh-time Okta status checker, or say why there isn't one.
+
+        Announced at boot either way. How long a deactivated staff member keeps a
+        working session — an hour or a week — is the kind of property that should
+        be readable in the startup log rather than inferred from the presence of
+        an env var nobody remembers setting.
+        """
+        admin_token = self.settings.okta_admin_token_value()
+        if not admin_token:
+            logger.info(
+                "refresh-time Okta user-status check DISABLED (OKTA_ADMIN_TOKEN not set): a "
+                "deactivated Okta account keeps working until its refresh token expires, up "
+                "to REFRESH_TTL (7 days).",
+                extra={"event_category": "auth.config", "server": self._audience},
+            )
+            return None
+        if not self.settings.okta_issuer:
+            # Nothing to call. Warn rather than raise: OKTA_ISSUER is already
+            # boot-required for an HTTP deployment (require_http_complete), so
+            # the only way to reach this is a local/stdio build where refusing to
+            # construct the provider would be the bigger surprise.
+            logger.warning(
+                "OKTA_ADMIN_TOKEN is set but OKTA_ISSUER is not, so the Okta admin API has no "
+                "host to call: the refresh-time user-status check is DISABLED.",
+                extra={"event_category": "auth.config.warning", "server": self._audience},
+            )
+            return None
+        logger.info(
+            "refresh-time Okta user-status check ENABLED (%ds cache): a deactivated Okta "
+            "account loses access within one access-token lifetime. Unavailable Okta = the "
+            "refresh is allowed and warned about.",
+            USER_STATUS_CACHE_TTL,
+            extra={"event_category": "auth.config", "server": self._audience},
+        )
+        return OktaUserStatus(issuer=self.settings.okta_issuer, admin_token=admin_token)
 
     def _warn_legacy_window(self) -> None:
         """Say out loud that the transition window is open.

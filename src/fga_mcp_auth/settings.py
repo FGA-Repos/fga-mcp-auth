@@ -161,6 +161,16 @@ class Settings(BaseSettings):
         default=None, validation_alias="OKTA_CLIENT_SECRET"
     )
 
+    # SSWS token for Okta's Users API, which enables the refresh-time user-status
+    # check (see user_status.py). Optional: unset means the check does not exist
+    # and REFRESH_TTL is the whole offboarding tail, exactly as in v1.0.0.
+    #
+    # Mint it from a READ-ONLY Okta admin account. An SSWS token inherits the
+    # permissions of whoever created it, so a Super Admin token pasted into seven
+    # DO app environments is a fleet-wide WRITE credential solving a read
+    # problem. This package only ever issues GET /api/v1/users/{login}.
+    okta_admin_token: SecretStr | None = Field(default=None, validation_alias="OKTA_ADMIN_TOKEN")
+
     # Server-wide login gate, enforced once at /okta/callback. Empty = any
     # authenticated Okta user. Non-empty + a token with no `groups` claim = DENY
     # (fail-closed): treating an absent claim as "no restriction" would turn a
@@ -229,6 +239,9 @@ class Settings(BaseSettings):
 
     def service_token_value(self) -> str | None:
         return self.bearer_token.get_secret_value() if self.bearer_token else None
+
+    def okta_admin_token_value(self) -> str | None:
+        return self.okta_admin_token.get_secret_value() if self.okta_admin_token else None
 
     # --- boot guard ---------------------------------------------------------
 

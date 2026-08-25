@@ -51,6 +51,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from .constants import ACCESS_TTL, REFRESH_TTL
 from .settings import Settings
 from .tokens import InvalidTokenFormat, user_from_claims
+from .user_status import OktaUserStatus
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ class GrantContext:
     settings: Settings
     mint: Callable[..., str]
     now: Callable[[], int] = lambda: int(time.time())
+    # Refresh-time Okta status check, or None when OKTA_ADMIN_TOKEN is unset.
+    # None is the v1.0.0 path, byte for byte.
+    user_status: OktaUserStatus | None = None
 
 
 async def authorization_code_grant(
@@ -108,10 +112,15 @@ async def refresh_token_grant(
 ) -> OAuthToken:
     """Refresh -> a new pair, on the ORIGINAL horizon.
 
-    Non-sliding on purpose: refresh re-mints from the token's own claims and
-    never re-contacts Okta, so a sliding expiry would let a deactivated account
-    renew itself forever. REFRESH_TTL is therefore literally the offboarding
-    tail, and this function is what keeps it bounded.
+    Non-sliding on purpose: refresh re-mints from the token's own claims, so a
+    sliding expiry would let a deactivated account renew itself forever.
+    REFRESH_TTL is therefore the outer bound on the offboarding tail, and this
+    function is what keeps it bounded.
+
+    With OKTA_ADMIN_TOKEN set, that bound stops being the whole story: this is
+    also where the account is re-checked against Okta (see user_status), which
+    takes the tail from <=7d down to one access-token lifetime. Without it, the
+    v1.0.0 behavior is unchanged and REFRESH_TTL is all there is.
 
     Both failure modes of `verify` are fatal here, for the same reason as in
     authorization_code_grant: no claims means no identity, and minting from an
@@ -162,6 +171,30 @@ async def refresh_token_grant(
             },
         )
         raise TokenError("invalid_grant", "Refresh token has expired; re-authenticate.")
+
+    # Deliberately AFTER the horizon check: a token that is already dead does not
+    # need Okta's opinion, and this is a network call inside a token exchange
+    # claude.ai is waiting on. Inert unless OKTA_ADMIN_TOKEN is set.
+    if ctx.user_status is not None:
+        verdict = await ctx.user_status.check(user.get("email", ""))
+        if not verdict.allow:
+            logger.info(
+                "Okta account is no longer active; refusing to re-mint",
+                extra={
+                    "client_id": client.client_id,
+                    "user": user.get("email", ""),
+                    "okta_status": verdict.status,
+                    "server": ctx.settings.audience,
+                    "event_category": "auth.refresh.user_inactive",
+                },
+            )
+            # Same error and the same sentence as an expired refresh token, on
+            # purpose. claude.ai renders invalid_grant as an inline Connect card
+            # and retries, so a deactivated user is sent to Okta and refused
+            # there, by the system that actually knows why. Saying "your account
+            # is deactivated" here would answer a question about an Okta account
+            # for whoever is holding the token, which is not always its owner.
+            raise TokenError("invalid_grant", "Refresh token is not valid; re-authenticate.")
 
     # `now` is threaded into the mint so the new `exp` is the OLD `exp` to the
     # second. Recomputing the clock inside mint() would let each hop drift the

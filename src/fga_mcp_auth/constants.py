@@ -15,9 +15,11 @@ ALLOWED_REDIRECT_DOMAINS = LOOPBACK_REDIRECT_HOSTS | HTTPS_REDIRECT_DOMAINS
 
 # --- lifetimes --------------------------------------------------------------
 ACCESS_TTL = 3600  # 1h — short because stateless tokens can't be revoked
-# Bounds the offboarding tail. Refresh re-mints from the token's own claims and
-# never re-contacts Okta, so a deactivated account keeps working until its refresh
-# token expires; this window IS that exposure. 7d rather than 24h because staff
+# Bounds the offboarding tail. Refresh re-mints from the token's own claims, so
+# without OKTA_ADMIN_TOKEN set (see below) nothing re-contacts Okta and a
+# deactivated account keeps working until its refresh token expires: this window
+# IS that exposure, and it stays the backstop even with the check on.
+# 7d rather than 24h because staff
 # Okta sessions are 12h with a persistent cookie, so re-login is normally a silent
 # redirect — but a daily one would still be felt. Do not raise this back to 30d.
 # Immediate cut-off would need Okta's own refresh token exchanged on each refresh,
@@ -26,6 +28,28 @@ ACCESS_TTL = 3600  # 1h — short because stateless tokens can't be revoked
 REFRESH_TTL = 7 * 24 * 3600
 AUTH_CODE_TTL = 300
 PENDING_TTL = 600  # how long the Okta round-trip can take before state expires
+
+# --- refresh-time Okta user-status check (opt-in, OKTA_ADMIN_TOKEN) ---------
+# With the check on, the paragraph above still holds as the BACKSTOP but stops
+# being the whole story: a deactivated account loses access on its next refresh,
+# so the tail is one ACCESS_TTL plus at most this cache window rather than 7d.
+#
+# 300s is the trade between how fresh a deactivation is and how many admin-API
+# calls a fleet of seven servers makes on every session refresh. Raising it
+# lengthens the tail one-for-one; lowering it buys minutes and costs quota.
+USER_STATUS_CACHE_TTL = 300
+# Short on purpose: this sits inside a token exchange claude.ai is waiting on,
+# and the failure policy is fail-open, so a slow Okta should hit the timeout and
+# allow rather than hang the refresh.
+USER_STATUS_TIMEOUT = 5.0
+# The two Okta statuses a human can still sign in from. PASSWORD_EXPIRED is one
+# of them: the account is live, Okta will make them change their password at the
+# next interactive login, and killing their session for it would be a password
+# policy enforced as an outage. Everything else — SUSPENDED, DEPROVISIONED,
+# LOCKED_OUT, PROVISIONED, RECOVERY, STAGED, and anything Okta adds later —
+# denies, because this gate is the offboarding bound and an unrecognized status
+# must not silently widen it.
+OKTA_LOGIN_STATUSES = frozenset({"ACTIVE", "PASSWORD_EXPIRED"})
 
 # --- registry ---------------------------------------------------------------
 # DCR is unauthenticated by design (claude.ai has to be able to register), so the

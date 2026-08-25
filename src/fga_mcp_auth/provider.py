@@ -219,14 +219,24 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
                 extra={"event_category": "auth.config.warning", "server": self._audience},
             )
             return None
+        # CONFIGURED, not ENABLED. An SSWS token in the environment is not the
+        # same thing as an SSWS token Okta accepts, and this check fails open, so
+        # a revoked or under-scoped one is dead quietly while a boot line claims
+        # it is running. The confident "ENABLED" line is emitted by
+        # OktaUserStatus.verify_admin_token() once Okta has agreed, and an
+        # outright rejection is an ERROR from the same place.
         logger.info(
-            "refresh-time Okta user-status check ENABLED (%ds cache): a deactivated Okta "
-            "account loses access within one access-token lifetime. Unavailable Okta = the "
-            "refresh is allowed and warned about.",
+            "refresh-time Okta user-status check CONFIGURED (%ds cache); OKTA_ADMIN_TOKEN is "
+            "verified against Okta on first use, and that result — not this line — says "
+            "whether the check is actually running.",
             USER_STATUS_CACHE_TTL,
             extra={"event_category": "auth.config", "server": self._audience},
         )
-        return OktaUserStatus(issuer=self.settings.okta_issuer, admin_token=admin_token)
+        return OktaUserStatus(
+            issuer=self.settings.okta_issuer,
+            admin_token=admin_token,
+            server=self._audience or "",
+        )
 
     def _warn_legacy_window(self) -> None:
         """Say out loud that the transition window is open.

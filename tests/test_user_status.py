@@ -6,9 +6,10 @@ instead of riding out the 7-day REFRESH_TTL. The failure policy is the other hal
 and matters just as much — an Okta admin-API hiccup must NOT lock every staff
 member out of every MCP server, so unavailability allows and warns.
 
-Everything is offline: the one endpoint the package calls
-(`GET /api/v1/users/{login}`) is stubbed with respx, and any unstubbed request
-raises rather than reaching a real tenant.
+Everything is offline: both endpoints the package calls
+(`GET /api/v1/users/{login}` and the once-per-process `GET /api/v1/users/me`
+admin-token canary) are stubbed with respx, and any unstubbed request raises
+rather than reaching a real tenant.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from conftest import (
     make_client,
     make_provider,
     make_settings,
+    okta_me_url,
     okta_user_url,
 )
 
@@ -47,8 +49,24 @@ def checking_provider(**kwargs):
     return make_provider(okta_admin_token=OKTA_ADMIN_TOKEN, **kwargs)
 
 
+def canary_route(status_code: int = 200, *, side_effect=None):
+    """Stub the one-time OKTA_ADMIN_TOKEN canary (`GET /api/v1/users/me`).
+
+    It fires on the first lookup a checker makes, so every test that reaches Okta
+    needs it stubbed whether or not the canary is what it is about — `users_route`
+    does that for you. respx dedupes by pattern and the LAST mock wins, so a test
+    that wants a specific canary response calls this AFTER `users_route`.
+    """
+    route = respx.get(okta_me_url())
+    if side_effect is not None:
+        return route.mock(side_effect=side_effect)
+    return route.mock(return_value=httpx.Response(status_code, json={"id": "00uadminwhomintedit"}))
+
+
 def users_route(status_code: int = 200, *, status: str | None = "ACTIVE", side_effect=None):
-    """Stub the Okta Users API. Call inside a `with respx.mock:` block."""
+    """Stub the Okta Users API — and the canary, which is not what most of these
+    tests are about. Call inside a `with respx.mock:` block."""
+    canary_route()
     route = respx.get(okta_user_url(USER["email"]))
     if side_effect is not None:
         return route.mock(side_effect=side_effect)
@@ -94,10 +112,13 @@ class TestDisabledByDefault:
             assert respx.calls.call_count == 0
         assert out.access_token
 
-    def test_boot_says_the_check_is_enabled_when_the_token_is_set(self, caplog):
+    def test_boot_says_the_check_is_configured_when_the_token_is_set(self, caplog):
+        """CONFIGURED, not ENABLED: at boot all we know is that an env var is
+        set. Okta has the last word — see TestAdminTokenCanary."""
         with caplog.at_level(logging.INFO):
             provider = checking_provider()
-        assert "refresh-time Okta user-status check ENABLED" in caplog.text
+        assert "refresh-time Okta user-status check CONFIGURED" in caplog.text
+        assert "ENABLED" not in caplog.text
         assert provider._user_status is not None
 
     def test_the_boot_log_never_prints_the_admin_token(self, caplog):
@@ -184,11 +205,13 @@ class TestInactiveUsersAreRefused:
                 await refresh(provider)
         assert exc.value.error == "invalid_grant"
 
-    async def test_the_refusal_is_shaped_like_an_expired_refresh_token(self):
-        """Same error, same sentence — claude.ai renders invalid_grant as an
-        inline Connect card, so the user is sent to Okta and refused there by the
-        system that knows why. It also means the response does not answer "is
-        this account deactivated?" for whoever holds the token."""
+    async def test_the_refusal_is_shaped_like_an_unverifiable_refresh_token(self):
+        """`invalid_grant` with the verification-failure sentence — the "is not
+        valid" one, NOT the expired-token sentence, which names its reason.
+        claude.ai renders invalid_grant as an inline Connect card, so the user is
+        sent to Okta and refused there by the system that knows why, and the
+        response never answers "is this account deactivated?" for whoever is
+        holding the token."""
         provider = checking_provider()
         with respx.mock:
             users_route(status="DEPROVISIONED")
@@ -196,6 +219,7 @@ class TestInactiveUsersAreRefused:
                 await refresh(provider)
         assert exc.value.error == "invalid_grant"
         assert exc.value.error_description == "Refresh token is not valid; re-authenticate."
+        assert "expired" not in exc.value.error_description
 
     async def test_the_denial_is_logged_with_the_email_and_the_status(self, caplog):
         provider = checking_provider()
@@ -270,11 +294,50 @@ class TestUnavailableOktaFailsOpen:
     async def test_an_unreadable_body_allows_the_refresh(self):
         provider = checking_provider()
         with respx.mock:
+            canary_route()
             respx.get(okta_user_url(USER["email"])).mock(
                 return_value=httpx.Response(200, content=b"<html>maintenance</html>")
             )
             out = await refresh(provider)
         assert out.access_token
+
+    @pytest.mark.parametrize(
+        "body", [["maintenance"], "down", 42], ids=["json-list", "json-string", "json-number"]
+    )
+    async def test_a_json_body_that_is_not_an_object_allows_and_warns(self, body, caplog):
+        """A 200 whose body parses but is not an object — a proxy, a WAF
+        interstitial, an error envelope. `.get()` on it used to raise
+        AttributeError out of check(), whose contract is that it never raises, and
+        an escaping exception here is a 500 on the token endpoint of every server
+        at once. It is as unreadable as torn JSON, so it takes the same path."""
+        provider = checking_provider()
+        with caplog.at_level(logging.WARNING), respx.mock:
+            canary_route()
+            respx.get(okta_user_url(USER["email"])).mock(
+                return_value=httpx.Response(200, json=body)
+            )
+            out = await refresh(provider)
+        assert out.access_token
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_category", "") == "auth.refresh.status_check_unavailable"
+        )
+        assert record.user == USER["email"]
+
+    async def test_a_non_object_body_is_not_cached_as_an_allow(self):
+        """Fail-open, not fail-open-for-five-minutes: the next refresh has to ask
+        again, or one bad gateway response buys a deactivated account a window."""
+        provider = checking_provider()
+        client = make_client()
+        with respx.mock:
+            canary_route()
+            route = respx.get(okta_user_url(USER["email"])).mock(
+                return_value=httpx.Response(200, json=["maintenance"])
+            )
+            await refresh(provider, client)
+            await refresh(provider, client)
+        assert route.call_count == 2
 
     async def test_a_token_with_no_email_claim_allows_and_warns(self, caplog):
         """Nothing to ask Okta about. Same reasoning as a 5xx: our gap, not the
@@ -303,6 +366,146 @@ class TestUnavailableOktaFailsOpen:
             users_route(side_effect=httpx.ConnectError("down"))
             out = await provider.exchange_refresh_token(client, rt, [])
         assert decode(out.refresh_token)["exp"] == decode(original)["exp"]
+
+
+class TestAdminTokenCanary:
+    """Setting OKTA_ADMIN_TOKEN turns the check on; Okta accepting it is what
+    makes it work, and those are not the same fact.
+
+    Because the check fails open, a revoked, rotated, mistyped or under-scoped
+    SSWS token is invisible: every lookup 401s, every 401 allows the refresh with
+    a WARNING that looks like an Okta hiccup, and the offboarding tail is quietly
+    back to 7 days while the config says otherwise. So the first lookup of the
+    process asks Okta about the token itself and says, once, which of the three
+    states the check is really in.
+    """
+
+    async def test_a_good_token_earns_the_enabled_line(self, caplog):
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            await refresh(provider)
+        assert "refresh-time Okta user-status check ENABLED" in caplog.text
+        assert "admin token accepted by Okta" in caplog.text
+
+    async def test_the_canary_carries_the_ssws_header(self):
+        provider = checking_provider()
+        with respx.mock:
+            users_route(status="ACTIVE")
+            canary = canary_route()
+            await refresh(provider)
+        assert canary.call_count == 1
+        assert canary.calls[0].request.headers["authorization"] == f"SSWS {OKTA_ADMIN_TOKEN}"
+
+    async def test_it_runs_once_per_process_not_once_per_refresh(self):
+        """It is a boot check that happens to be lazy, not a per-refresh cost."""
+        provider = checking_provider()
+        client = make_client()
+        with respx.mock:
+            users_route(status="ACTIVE")
+            canary = canary_route()
+            await refresh(provider, client)
+            provider._user_status._allowed_until.clear()  # force real lookups
+            await refresh(provider, client)
+            provider._user_status._allowed_until.clear()
+            await refresh(provider, client)
+        assert canary.call_count == 1
+
+    async def test_it_runs_once_even_when_okta_is_down(self):
+        """The latch is set before the request, so a failed canary is not retried
+        on every refresh for the life of the process."""
+        provider = checking_provider()
+        client = make_client()
+        with respx.mock:
+            users_route(status="ACTIVE")
+            canary = canary_route(side_effect=httpx.ConnectError("down"))
+            await refresh(provider, client)
+            provider._user_status._allowed_until.clear()
+            await refresh(provider, client)
+        assert canary.call_count == 1
+
+    @pytest.mark.parametrize("code", [401, 403])
+    async def test_a_rejected_token_is_an_error_saying_the_check_is_off(self, code, caplog):
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            canary_route(code)
+            await refresh(provider)
+        record = next(
+            r for r in caplog.records if getattr(r, "event_category", "") == "auth.config.error"
+        )
+        assert record.levelno == logging.ERROR
+        assert "EFFECTIVELY OFF" in record.getMessage()
+        assert "REFRESH_TTL" in record.getMessage()
+        assert "ENABLED" not in caplog.text
+
+    async def test_a_rejected_token_still_never_denies_a_refresh(self):
+        """The canary reports; it does not decide. Turning a bad admin token into
+        a fleet-wide lockout is exactly what fail-open exists to prevent."""
+        provider = checking_provider()
+        with respx.mock:
+            users_route(401, status=None)
+            canary_route(401)
+            out = await refresh(provider)
+        assert out.access_token
+
+    async def test_a_network_error_is_only_a_warning(self, caplog):
+        """Indeterminate, not bad: the token may be fine and Okta unreachable."""
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            canary_route(side_effect=httpx.ConnectError("no route to host"))
+            out = await refresh(provider)
+        record = next(
+            r for r in caplog.records if getattr(r, "event_category", "") == "auth.config.warning"
+        )
+        assert record.levelno == logging.WARNING
+        assert "configured but unproven" in record.getMessage()
+        assert "ENABLED" not in caplog.text
+        assert out.access_token
+
+    @pytest.mark.parametrize("code", [429, 500, 503])
+    async def test_an_unexpected_status_is_only_a_warning(self, code, caplog):
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            canary_route(code)
+            await refresh(provider)
+        record = next(
+            r for r in caplog.records if getattr(r, "event_category", "") == "auth.config.warning"
+        )
+        assert record.levelno == logging.WARNING
+        assert "ENABLED" not in caplog.text
+
+    async def test_it_never_prints_the_admin_token(self, caplog):
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            canary_route(401)
+            await refresh(provider)
+        assert OKTA_ADMIN_TOKEN not in caplog.text
+
+    async def test_a_token_with_no_email_claim_does_not_trigger_it(self):
+        """Nothing is going to be looked up, so nothing needs proving yet."""
+        provider = checking_provider()
+        client = make_client()
+        anon = provider._mint("refresh", client.client_id, [], {"sub": "00u1"}, 600)
+        rt = await provider.load_refresh_token(client, anon)
+        with respx.mock:
+            await provider.exchange_refresh_token(client, rt, [])
+            assert respx.calls.call_count == 0
+
+    async def test_the_log_line_names_the_server(self, caplog):
+        """A fleet-wide "this check is off" alarm has to say which of the seven."""
+        provider = checking_provider()
+        with caplog.at_level(logging.INFO), respx.mock:
+            users_route(status="ACTIVE")
+            canary_route(403)
+            await refresh(provider)
+        record = next(
+            r for r in caplog.records if getattr(r, "event_category", "") == "auth.config.error"
+        )
+        assert record.server == provider._audience
 
 
 class TestCache:

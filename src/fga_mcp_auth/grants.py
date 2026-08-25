@@ -188,8 +188,9 @@ async def refresh_token_grant(
                     "event_category": "auth.refresh.user_inactive",
                 },
             )
-            # Same error and the same sentence as an expired refresh token, on
-            # purpose. claude.ai renders invalid_grant as an inline Connect card
+            # Same error and the same sentence as a refresh token that fails
+            # verification — NOT the expired-token sentence above, which names
+            # the reason. claude.ai renders invalid_grant as an inline Connect card
             # and retries, so a deactivated user is sent to Okta and refused
             # there, by the system that actually knows why. Saying "your account
             # is deactivated" here would answer a question about an Okta account

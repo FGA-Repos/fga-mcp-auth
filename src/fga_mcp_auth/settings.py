@@ -168,7 +168,8 @@ class Settings(BaseSettings):
     # Mint it from a READ-ONLY Okta admin account. An SSWS token inherits the
     # permissions of whoever created it, so a Super Admin token pasted into seven
     # DO app environments is a fleet-wide WRITE credential solving a read
-    # problem. This package only ever issues GET /api/v1/users/{login}.
+    # problem. This package only ever issues GET /api/v1/users/{login}, plus one
+    # GET /api/v1/users/me per process to prove this token still works.
     okta_admin_token: SecretStr | None = Field(default=None, validation_alias="OKTA_ADMIN_TOKEN")
 
     # Server-wide login gate, enforced once at /okta/callback. Empty = any

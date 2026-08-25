@@ -42,6 +42,11 @@ USER_STATUS_CACHE_TTL = 300
 # and the failure policy is fail-open, so a slow Okta should hit the timeout and
 # allow rather than hang the refresh.
 USER_STATUS_TIMEOUT = 5.0
+# The one-time canary that proves OKTA_ADMIN_TOKEN is actually accepted by Okta
+# (GET /api/v1/users/me) rides on the first refresh, so it gets the same budget
+# as the check itself: a slow Okta must not turn the first refresh of the process
+# into a ten-second wait.
+USER_STATUS_BOOT_TIMEOUT = 5.0
 # The two Okta statuses a human can still sign in from. PASSWORD_EXPIRED is one
 # of them: the account is live, Okta will make them change their password at the
 # next interactive login, and killing their session for it would be a password

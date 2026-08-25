@@ -23,7 +23,23 @@ setting.
 Mint that token from a **read-only** Okta admin account. An SSWS token inherits
 the permissions of whoever created it, so a Super Admin token sitting in seven
 app environments is a fleet-wide write credential solving a read problem. The
-only request this package ever makes is `GET /api/v1/users/{login}`.
+only requests this package ever makes are `GET /api/v1/users/{login}` and, once
+per process, the `GET /api/v1/users/me` canary described below.
+
+## Why there is a canary
+
+Setting OKTA_ADMIN_TOKEN is what turns the check on, but it is not what makes it
+work. A revoked, rotated, mistyped or under-scoped SSWS token produces 401/403 on
+every lookup, and because this check fails open, every one of those is a WARNING
+and an allowed refresh — the check is dead while the boot log claims it is on,
+which is the worst of both: no offboarding tail shortened, and nobody looking.
+
+So the first time the checker is actually used it asks Okta one question about
+itself (`GET /api/v1/users/me`, which an API token answers for the account that
+minted it). 401/403 is a definitive "this token is not going to work", and it is
+logged at ERROR saying the check is effectively OFF. Anything else transport-y is
+indeterminate and warns. Only a 200 earns the confident "ENABLED" line, which is
+therefore a statement about Okta rather than about the environment.
 
 ## Why it fails OPEN
 
@@ -57,7 +73,12 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .constants import OKTA_LOGIN_STATUSES, USER_STATUS_CACHE_TTL, USER_STATUS_TIMEOUT
+from .constants import (
+    OKTA_LOGIN_STATUSES,
+    USER_STATUS_BOOT_TIMEOUT,
+    USER_STATUS_CACHE_TTL,
+    USER_STATUS_TIMEOUT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +121,17 @@ class OktaUserStatus:
         admin_token: str,
         ttl: int = USER_STATUS_CACHE_TTL,
         timeout: float = USER_STATUS_TIMEOUT,
+        server: str = "",
     ) -> None:
         self._base = admin_base(issuer)
         self._headers = {"Authorization": f"SSWS {admin_token}", "Accept": "application/json"}
         self._ttl = ttl
+        # Only for the log lines: a fleet-wide "this check is OFF" alarm has to
+        # say which of the seven servers is shouting.
+        self._server = server
+        # One-shot latch for the canary below. Set BEFORE the request, not after,
+        # so two concurrent first refreshes ask Okta about the token once.
+        self._token_verified = False
         # email -> monotonic deadline. ALLOW decisions only, and monotonic so a
         # clock adjustment cannot extend one. shortcut: a plain dict with
         # opportunistic pruning, no lock — two concurrent refreshes for the same
@@ -116,6 +144,76 @@ class OktaUserStatus:
         # the wiring helper and the app lifespan never sees it.
         self._http = httpx.AsyncClient(timeout=timeout)
 
+    async def verify_admin_token(self) -> None:
+        """Ask Okta once whether OKTA_ADMIN_TOKEN is a credential it accepts.
+
+        Runs on first use rather than at construction because the provider is
+        built synchronously — the wiring helpers have no async boot hook and the
+        app's event loop usually does not exist yet — and scheduling a
+        fire-and-forget task from `__init__` would put an unawaited network call
+        in every consumer's startup path. First use is the first refresh, so in
+        a live fleet this lands within the hour and always before the first
+        answer this checker gives is trusted.
+
+        Never raises and never denies: its entire output is one log line saying
+        which of the three states the check is really in.
+        """
+        self._token_verified = True
+        url = f"{self._base}/api/v1/users/me"
+        common = {"event_category": "auth.config", "server": self._server}
+        try:
+            resp = await self._http.get(
+                url, headers=self._headers, timeout=USER_STATUS_BOOT_TIMEOUT
+            )
+        except httpx.HTTPError as exc:
+            # Indeterminate, not bad: the token may be perfectly good and Okta
+            # merely unreachable right now. Every real lookup fails open and
+            # warns on its own, so this does not need to escalate.
+            logger.warning(
+                "Could not verify OKTA_ADMIN_TOKEN against Okta (%s: %s); the refresh-time "
+                "user-status check is configured but unproven. Watch for "
+                "auth.refresh.status_check_unavailable.",
+                type(exc).__name__,
+                exc,
+                extra={**common, "event_category": "auth.config.warning"},
+            )
+            return
+
+        if resp.status_code in (401, 403):
+            # Definitive. Every lookup this token makes will 401/403, and because
+            # the check fails open, every one of them allows the refresh: the
+            # offboarding tail is silently back to REFRESH_TTL while the config
+            # says otherwise. ERROR because nothing else in this module can tell
+            # an operator that the feature they turned on is not running.
+            logger.error(
+                "refresh-time Okta user-status check is EFFECTIVELY OFF: Okta rejected "
+                "OKTA_ADMIN_TOKEN with HTTP %d (revoked, mistyped, or the admin account it "
+                "was minted from lacks user-read). Every refresh will fail open, so a "
+                "deactivated Okta account keeps working for up to REFRESH_TTL (7 days). "
+                "Re-mint the token from a READ-ONLY Okta admin account.",
+                resp.status_code,
+                extra={**common, "event_category": "auth.config.error"},
+            )
+            return
+
+        if resp.status_code != 200:
+            logger.warning(
+                "Could not verify OKTA_ADMIN_TOKEN against Okta (HTTP %d); the refresh-time "
+                "user-status check is configured but unproven. Watch for "
+                "auth.refresh.status_check_unavailable.",
+                resp.status_code,
+                extra={**common, "event_category": "auth.config.warning"},
+            )
+            return
+
+        logger.info(
+            "refresh-time Okta user-status check ENABLED (%ds cache, admin token accepted by "
+            "Okta): a deactivated Okta account loses access within one access-token lifetime. "
+            "Unavailable Okta = the refresh is allowed and warned about.",
+            self._ttl,
+            extra=common,
+        )
+
     async def check(self, email: str) -> StatusVerdict:
         """Allow-or-deny for one email. Never raises."""
         if not email:
@@ -124,6 +222,12 @@ class OktaUserStatus:
             # break every session whose token predates an email claim.
             self._unavailable(email, "the token carries no email claim")
             return StatusVerdict(True, "unchecked")
+
+        if not self._token_verified:
+            # Before the first real answer is trusted, once per process. Sits
+            # after the no-email guard so a token with nothing to look up does
+            # not trigger an Okta round-trip either.
+            await self.verify_admin_token()
 
         now = time.monotonic()
         deadline = self._allowed_until.get(email)
@@ -153,10 +257,26 @@ class OktaUserStatus:
             return StatusVerdict(True, "unavailable")
 
         try:
-            status = str(resp.json().get("status") or "")
+            body = resp.json()
         except ValueError as exc:  # includes json.JSONDecodeError
             self._unavailable(email, f"unreadable response body: {exc}")
             return StatusVerdict(True, "unavailable")
+
+        # A 200 carrying valid JSON that is not an object — a list, a bare
+        # string, a number — comes from something that is not the Users API: a
+        # proxy, a WAF interstitial, an error envelope. `.get()` on it raises
+        # AttributeError straight out of check(), whose contract is that it never
+        # raises, and on the token endpoint of seven servers that is a fleet-wide
+        # 500 rather than the fail-open this module promises. Unreadable is
+        # unreadable, whatever shape it arrives in.
+        #
+        # A dict with no "status" is deliberately NOT this case: that is Okta
+        # answering, and an answer we cannot read a login status out of denies
+        # (see below) — the gate must not widen just because a field moved.
+        if not isinstance(body, dict):
+            self._unavailable(email, f"response body is JSON {type(body).__name__}, not an object")
+            return StatusVerdict(True, "unavailable")
+        status = str(body.get("status") or "")
 
         if status in OKTA_LOGIN_STATUSES:
             self._allowed_until[email] = time.monotonic() + self._ttl

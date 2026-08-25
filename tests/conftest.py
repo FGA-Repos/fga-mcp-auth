@@ -90,8 +90,13 @@ ALL_ENV = [
 
 
 def okta_user_url(email: str) -> str:
-    """The one admin-API endpoint this package calls, for respx to stub."""
+    """The admin-API endpoint every status lookup hits, for respx to stub."""
     return f"{OKTA_ISSUER}/api/v1/users/{quote(email, safe='')}"
+
+
+def okta_me_url() -> str:
+    """The one-time OKTA_ADMIN_TOKEN canary (v1.1), fired on the first lookup."""
+    return f"{OKTA_ISSUER}/api/v1/users/me"
 
 
 @pytest.fixture(autouse=True)

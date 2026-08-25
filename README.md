@@ -238,7 +238,8 @@ Each server also needs its Okta redirect URI registered on the shared app:
   inherits the permissions of whoever created it and has no scopes of its own, so
   a Super Admin token copied into seven DO app environments is a fleet-wide write
   credential — user creation, group membership, app assignment — bought to answer
-  one read question. This package only ever issues `GET /api/v1/users/{login}`.
+  one read question. This package only ever issues `GET /api/v1/users/{login}`,
+  plus one `GET /api/v1/users/me` per process (the token canary below).
   Rotating it is safe in the sense that matters operationally: a revoked token
   fails open — the check stops working, loudly — rather than denying every
   refresh on the fleet.
@@ -348,6 +349,26 @@ claude.ai shows the reconnect card and Okta does the actual refusing.
 deleted), and any status Okta invents later, because this gate *is* the
 offboarding bound and an unrecognized string must not silently widen it.
 
+⚠️ **The lookup resolves by Okta *login*, using the token's `email` claim — it
+assumes login == email, which is true at FGA today.** Rename someone's Okta login
+away from their email and that person 404s: an *active* account denied at every
+refresh, reconnecting roughly hourly, with `auth.refresh.user_inactive` logging
+`okta_status=NOT_FOUND`. If a login ever gets renamed, that log line is the tell.
+
+**`OKTA_ADMIN_TOKEN` being set is not proof the check runs.** Because it fails
+open, a revoked, rotated, mistyped or under-scoped SSWS token 401s on every
+lookup and every one of those *allows* the refresh — the tail is quietly back to
+7 days. So the first lookup of each process first asks Okta about the token
+itself (`GET /api/v1/users/me`, once, 5s, never fatal) and logs the verdict:
+
+| Boot / first-refresh log | Means |
+|---|---|
+| `...check DISABLED (OKTA_ADMIN_TOKEN not set)` | v1.0.0 behavior, on purpose. |
+| `...check CONFIGURED` | The env var is set. Nothing verified yet — Okta has not been asked. |
+| `...check ENABLED (…admin token accepted by Okta)` | Running. This is the line to alert on the absence of. |
+| `...check is EFFECTIVELY OFF` (ERROR) | Okta rejected the token (401/403). Re-mint it; until then the tail is `REFRESH_TTL`. |
+| `Could not verify OKTA_ADMIN_TOKEN…` (WARNING) | Indeterminate — Okta was unreachable. The token may be fine. |
+
 ## Deliberate behavior changes vs. live quorum and ob3 — FLAGGED
 
 Everything else in this package is the safer of the two live implementations.
@@ -402,6 +423,11 @@ wrong leg; everything else runs on both.
   taking the tail down to one access-token lifetime. Fails **open** on any
   unavailability, because a check that denies during an Okta blip is a
   fleet-wide outage of its own making. See **Offboarding semantics**.
+* The admin token is **verified against Okta once per process** before its first
+  answer is trusted, and the check only calls itself `ENABLED` after Okta agrees.
+  A rejected token is an `ERROR` saying the check is *effectively off* rather
+  than a boot line claiming it is on — a fail-open check with a dead credential
+  is otherwise indistinguishable from a working one.
 * Unset `OKTA_ADMIN_TOKEN` is v1.0.0 behavior exactly, and which one you are
   running is stated in the startup log rather than left to be inferred.
 * No change to the service-bearer path, the login leg, the token format (`v` is

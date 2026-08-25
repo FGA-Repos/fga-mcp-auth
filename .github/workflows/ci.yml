@@ -30,8 +30,8 @@ jobs:
 
       - name: Lint
         run: |
-          uv run --isolated --group dev ruff check .
-          uv run --isolated --group dev ruff format --check .
+          uv run --isolated --locked --group dev ruff check .
+          uv run --isolated --locked --group dev ruff format --check .
 
       - name: Test
-        run: uv run --isolated --group dev --group ${{ matrix.sdk }} pytest
+        run: uv run --isolated --locked --group dev --group ${{ matrix.sdk }} pytest

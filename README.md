@@ -398,6 +398,10 @@ which is all claude.ai parses.
 * Bump one consumer at a time and deliberately. There is no fleet-wide upgrade
   button, on purpose: a regression in this package logs staff out of whichever
   servers took it.
+* CI runs `--locked`: every job installs exactly the resolution in `uv.lock` and
+  fails if `pyproject.toml` and the lockfile have drifted.
+* Dependency updates are therefore deliberate — run `uv lock` and commit the
+  lockfile alongside the `pyproject.toml` change, never as a silent CI-time float.
 
 ## Test matrix
 

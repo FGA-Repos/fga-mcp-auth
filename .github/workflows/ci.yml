@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]        # single-writer repo: no staging, direct commits to main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [sdk1, sdk2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"          # requires-python is >=3.11; pin so CI can't float
+          cache-suffix: ${{ matrix.sdk }} # legs resolve different groups — separate cache keys
+          cache-dependency-glob: "**/pyproject.toml"
+
+      - name: Lint
+        run: |
+          uv run --isolated --group dev ruff check .
+          uv run --isolated --group dev ruff format --check .
+
+      - name: Test
+        run: uv run --isolated --group dev --group ${{ matrix.sdk }} pytest

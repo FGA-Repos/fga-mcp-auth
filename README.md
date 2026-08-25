@@ -26,6 +26,9 @@ Enterprise Managed Auth grant, say) lands once instead of seven times.
   curl and CI.
 * Ships **per-user audit logging** (SDK 2.0) and an opt-in **per-tool group
   gate**.
+* Optionally **re-checks the user's Okta status at every refresh**
+  (`OKTA_ADMIN_TOKEN`), which cuts the offboarding tail from ≤7 days to ≤1 hour.
+  Fails open by design — see **Offboarding semantics**.
 
 ## What it deliberately is not
 
@@ -35,10 +38,11 @@ Enterprise Managed Auth grant, say) lands once instead of seven times.
   anything. The wiring advertises `RevocationOptions(enabled=False)` rather than
   returning HTTP 200 to a revocation request while the token keeps working. The
   blunt instrument is rotating `MCP_TOKEN_SECRET`, which invalidates everything.
-* **No Okta re-check at refresh.** Refresh re-mints from the token's own claims,
-  so a deactivated Okta account keeps working until its refresh token expires.
-  `REFRESH_TTL` (7 days) *is* the offboarding tail. Adding a status check needs
-  an SSWS token in seven deploys plus a failure policy — deferred to v1.1.
+* **No *continuous* Okta re-check.** Since v1.1 the status check runs at the
+  refresh grant only (opt-in, `OKTA_ADMIN_TOKEN`), not per MCP request — that
+  would be an Okta admin-API call on every tool call. So a deactivated account
+  keeps its current access token until it expires: the tail is ≤1h with the check
+  on, ≤7 days without. See **Offboarding semantics**.
 * **No EMA / jwt-bearer grant.** Waitlist-gated. `grants.py` keeps the door open
   (isolated grant handlers, RFC 8707 `resource` carried through) and nothing
   more. Its docstring also records how the grant will have to be *mounted* —
@@ -54,7 +58,7 @@ Dockerfiles are `python:3.12-slim` with no git binary, and a tarball at a full
 commit SHA is immutable where a tag is not:
 
 ```
-# fga-mcp-auth v1.0.0
+# fga-mcp-auth v1.1.0
 fga-mcp-auth @ https://github.com/FGA-Repos/fga-mcp-auth/archive/<full-40-char-sha>.tar.gz
 ```
 
@@ -167,6 +171,7 @@ future change.
 | `MCP_BEARER_TOKEN` | no | Static service token for socialbot / curl / CI. Unset = no service path. **Must be `<MCP_SERVER_SLUG>.<random>`** — anything else refuses to boot (see `MCP_REQUIRE_BOUND_BEARER`). A value of exactly `<slug>.` is always fatal. |
 | `MCP_REQUIRE_BOUND_BEARER` | no | **Default on.** `false` downgrades the refusal above to a boot warning — the retrofit-only escape hatch for quorum and ob3, whose live unprefixed bearers socialbot also holds. Set it for that deploy, re-issue the bearer, then delete the variable. Nothing else should ever set it. |
 | `MCP_ACCEPT_LEGACY_TOKENS` | no | `true` accepts pre-package tokens (no `aud`, no `v`) as format v1, for a silent retrofit cutover. Default off. Turn it back off inside the 7-day refresh window. |
+| `OKTA_ADMIN_TOKEN` | no | SSWS token for Okta's Users API. Set = the refresh-time user-status check is on (a deactivated account loses access within ≤1h instead of ≤7d). Unset = no check, v1.0.0 behavior. **Mint it from a READ-ONLY Okta admin account** — an SSWS token inherits its creator's permissions, so a Super Admin token in seven DO app environments is a fleet-wide *write* credential solving a read problem. |
 | `OKTA_ALLOWED_GROUPS` | no | CSV. Server-wide login gate. Empty = any authenticated Okta user. **Non-empty with no groups claim on the app = everyone denied.** |
 | `OKTA_ALLOWED_EMAIL_DOMAINS` | no | CSV. Second login gate, checked beside groups. Empty = inert. |
 | `MCP_TOOL_GATING` | no | `true` enables `GroupGate`. Default off. |
@@ -229,6 +234,14 @@ Each server also needs its Okta redirect URI registered on the shared app:
   `MCP_REQUIRE_BOUND_BEARER=false` exists only so the two live servers can be
   retrofitted without a synchronized rotation. Distinct random half per server
   as well.
+* **Mint `OKTA_ADMIN_TOKEN` from a read-only admin account.** An Okta SSWS token
+  inherits the permissions of whoever created it and has no scopes of its own, so
+  a Super Admin token copied into seven DO app environments is a fleet-wide write
+  credential — user creation, group membership, app assignment — bought to answer
+  one read question. This package only ever issues `GET /api/v1/users/{login}`.
+  Rotating it is safe in the sense that matters operationally: a revoked token
+  fails open — the check stops working, loudly — rather than denying every
+  refresh on the fleet.
 * **`MCP_ALLOWED_HOST` is load-bearing.** Unset, `public_base_url` falls back to
   `http://localhost:8080` — the same string on every FGA MCP server. That is why
   it is boot-required, and why `aud` exists on top of it.
@@ -273,9 +286,10 @@ change costs one click, never a 500.
 
 Access tokens live 1 hour, refresh tokens 7 days, and refresh does **not** slide
 the horizon — no floor, no exceptions. A refresh with 5 seconds left returns a
-5-second pair; at 0 it returns `invalid_grant`. `REFRESH_TTL` is the offboarding
-tail, so anything that lets a loop walk the expiry forward (a `max(60, …)` floor
-did exactly that) is the end of the guarantee, not a rounding detail.
+5-second pair; at 0 it returns `invalid_grant`. `REFRESH_TTL` is the outer bound
+on the offboarding tail, so anything that lets a loop walk the expiry forward (a
+`max(60, …)` floor did exactly that) is the end of the guarantee, not a rounding
+detail. `OKTA_ADMIN_TOKEN` tightens the bound; it does not replace it.
 
 ### Deploying the retrofit: one forced reconnect, or the transition switch
 
@@ -305,6 +319,34 @@ Neither option is behavior-identical, and no test can catch the cutover itself
 deploy-timing decision for Jacob rather than an implementation detail.
 `TestLegacyTokenRejection` pins the default failure shape and
 `TestLegacyTransitionWindow` pins what the switch does and does not loosen.
+
+## Offboarding semantics
+
+What actually happens when IT deactivates someone in Okta. This is the question
+the whole token design answers, so it is written down rather than inferred.
+
+| Path | Cut-off |
+|---|---|
+| **Interactive login** (a new connector, or any re-auth) | **Immediate.** Okta refuses the OIDC hop; we never see them. |
+| **Refresh, with `OKTA_ADMIN_TOKEN` set** | **≤1 hour** — their next refresh is `invalid_grant`, so they keep only the access token they already hold (`ACCESS_TTL`, 1h), plus at most the 300s status cache. |
+| **Refresh, without it** | **≤7 days** (`REFRESH_TTL`). Refresh re-mints from the token's own claims, so nothing about the deactivation reaches it. |
+| **`MCP_BEARER_TOKEN`** | **Never.** It is a service credential, not a person, and it does not refresh. Rotate it. |
+| **Emergency kill switch** | **Rotate `MCP_TOKEN_SECRET`.** Every token that server ever signed stops verifying at the next request. Fleet-wide means rotating it on each server, which is the point — distinct secrets per server. |
+
+The refresh check **fails open**: a timeout, transport error, 429, 5xx, or a
+revoked SSWS token allows the refresh and logs
+`auth.refresh.status_check_unavailable` at WARNING. An Okta admin-API hiccup
+would otherwise lock every staff member out of every MCP server at once, and the
+`REFRESH_TTL` horizon is still underneath as the backstop — the worst case of a
+failing check is exactly the v1.0.0 behavior. A denial logs
+`auth.refresh.user_inactive` with the email and the Okta status, and answers
+`invalid_grant` with the same description an expired refresh token gets, so
+claude.ai shows the reconnect card and Okta does the actual refusing.
+
+`ACTIVE` and `PASSWORD_EXPIRED` pass. Everything else denies — `SUSPENDED`,
+`DEPROVISIONED`, `LOCKED_OUT`, a 404 (deprovisioned accounts are eventually
+deleted), and any status Okta invents later, because this gate *is* the
+offboarding bound and an unrecognized string must not silently widen it.
 
 ## Deliberate behavior changes vs. live quorum and ob3 — FLAGGED
 
@@ -349,6 +391,22 @@ uv run --isolated --group dev --group sdk2 pytest    # mcp>=2
 wrong leg; everything else runs on both.
 
 ## Changelog
+
+### 1.1.0
+
+* **New — refresh-time Okta user-status check (`OKTA_ADMIN_TOKEN`, opt-in).**
+  Stateless refresh tokens re-mint from their own claims, so v1.0.0's offboarding
+  tail was the full 7-day `REFRESH_TTL`. With an SSWS token set, every
+  `refresh_token` grant asks Okta whether the account can still log in (300s
+  per-email cache, allow-results only) and answers `invalid_grant` if it cannot —
+  taking the tail down to one access-token lifetime. Fails **open** on any
+  unavailability, because a check that denies during an Okta blip is a
+  fleet-wide outage of its own making. See **Offboarding semantics**.
+* Unset `OKTA_ADMIN_TOKEN` is v1.0.0 behavior exactly, and which one you are
+  running is stated in the startup log rather than left to be inferred.
+* No change to the service-bearer path, the login leg, the token format (`v` is
+  still 1), or any wiring signature. Nothing in a consumer has to change to take
+  this version.
 
 ### 1.0.0
 

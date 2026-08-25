@@ -1,6 +1,6 @@
 [project]
 name = "fga-mcp-auth"
-version = "1.0.0"
+version = "1.1.0"
 description = "FGA's shared Okta OIDC auth layer for MCP servers (SDK 1.x and 2.0)"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 import jwt
@@ -49,6 +49,9 @@ def service_token_for(slug: str) -> str:
 OKTA_ISSUER = "https://example.okta.com"
 OKTA_CLIENT_ID = "0oaEXAMPLECLIENTID000"
 OKTA_CLIENT_SECRET = "okta-client-secret"
+# SSWS token for the refresh-time user-status check (v1.1). Unset by default in
+# every fixture, so the whole suite runs the v1.0.0 path unless a test opts in.
+OKTA_ADMIN_TOKEN = "00ssws-read-only-admin-token"
 OKTA_META = {
     "issuer": OKTA_ISSUER,
     "authorization_endpoint": f"{OKTA_ISSUER}/oauth2/v1/authorize",
@@ -81,8 +84,14 @@ ALL_ENV = [
     "MCP_TOOL_GATING",
     "MCP_REQUIRE_BOUND_BEARER",
     "MCP_ACCEPT_LEGACY_TOKENS",
+    "OKTA_ADMIN_TOKEN",
     "MCP_PORT",
 ]
+
+
+def okta_user_url(email: str) -> str:
+    """The one admin-API endpoint this package calls, for respx to stub."""
+    return f"{OKTA_ISSUER}/api/v1/users/{quote(email, safe='')}"
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +162,7 @@ def make_settings(
     tool_gating: bool = False,
     require_bound_bearer: bool = True,
     accept_legacy_tokens: bool = False,
+    okta_admin_token: str | None = None,
 ) -> Settings:
     if service_token is _DERIVE_SERVICE_TOKEN:
         service_token = service_token_for(slug) if slug else None
@@ -164,6 +174,7 @@ def make_settings(
         okta_issuer=OKTA_ISSUER if okta else None,
         okta_client_id=OKTA_CLIENT_ID if okta else None,
         okta_client_secret=OKTA_CLIENT_SECRET if okta else None,
+        okta_admin_token=okta_admin_token,
         allowed_groups=allowed_groups,
         allowed_email_domains=allowed_email_domains,
         tool_gating_enabled=tool_gating,

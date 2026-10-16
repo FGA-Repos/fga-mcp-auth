@@ -16,6 +16,7 @@ from .constants import (
     ACCESS_TTL,
     ALLOWED_REDIRECT_DOMAINS,
     AUTH_CODE_TTL,
+    EXACT_REDIRECT_URIS,
     MAX_CLIENTS,
     PENDING_TTL,
     REFRESH_TTL,
@@ -29,7 +30,7 @@ from .redirects import is_allowed_redirect
 from .settings import OktaConfig, Settings
 from .tokens import InvalidTokenFormat
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 _LAZY = {
     "wire_sdk1": ("fga_mcp_auth.wiring.sdk1", "wire_sdk1"),
@@ -51,6 +52,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "ACCESS_TTL",
     "ALLOWED_REDIRECT_DOMAINS",
+    "EXACT_REDIRECT_URIS",
     "AUTH_CODE_TTL",
     "MAX_CLIENTS",
     "PENDING_TTL",

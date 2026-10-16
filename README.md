@@ -20,8 +20,10 @@ Enterprise Managed Auth grant, say) lands once instead of seven times.
 * Issues **stateless HS256 tokens** that carry the user's identity in their
   claims. Nothing is stored server-side, so a DO App Platform redeploy — which
   happens on every push — no longer logs every staff member out.
-* Enforces a **redirect allowlist at DCR registration**, keeps `/authorize`
-  answering on our own origin, and never reflects attacker-supplied text.
+* Enforces a **redirect allowlist at DCR registration** (claude.ai/claude.com,
+  loopback, plus exact URIs for named third-party clients such as Cursor's cloud
+  agent), keeps `/authorize` answering on our own origin, and never reflects
+  attacker-supplied text.
 * Keeps the static **`MCP_BEARER_TOKEN` service path** working for socialbot,
   curl and CI.
 * Ships **per-user audit logging** (SDK 2.0) and an opt-in **per-tool group
@@ -58,7 +60,7 @@ Dockerfiles are `python:3.12-slim` with no git binary, and a tarball at a full
 commit SHA is immutable where a tag is not:
 
 ```
-# fga-mcp-auth v1.1.0
+# fga-mcp-auth v1.2.0
 fga-mcp-auth @ https://github.com/FGA-Repos/fga-mcp-auth/archive/<full-40-char-sha>.tar.gz
 ```
 
@@ -416,6 +418,17 @@ uv run --isolated --group dev --group sdk2 pytest    # mcp>=2
 wrong leg; everything else runs on both.
 
 ## Changelog
+
+### 1.2.0
+
+* **New — exact-URI allowlist for third-party hosted clients**
+  (`EXACT_REDIRECT_URIS`). Cursor's cloud agent callback
+  (`https://www.cursor.com/agents/mcp/oauth/callback`) is the first entry. Local
+  clients (Claude Code, Grok Bot, anything with a loopback callback) already
+  passed; hosted clients other than Claude were refused at `/register` with
+  `invalid_redirect_uri`. Matching is byte-for-byte — no suffix, scheme, or
+  query variance — so the grant covers one callback path, not a host. Adding a
+  client is one line in `constants.py` plus a re-pin of every consumer.
 
 ### 1.1.0
 

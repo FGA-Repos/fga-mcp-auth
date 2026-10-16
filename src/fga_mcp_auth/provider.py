@@ -339,7 +339,7 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
                 raise RegistrationError(
                     "invalid_redirect_uri",
                     "redirect_uri must be https on claude.ai or claude.com, "
-                    "or http/https on localhost.",
+                    "http/https on localhost, or an allowlisted client callback.",
                 )
         self._clients[client_info.client_id] = client_info
         while len(self._clients) > MAX_CLIENTS:

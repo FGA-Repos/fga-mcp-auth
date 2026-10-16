@@ -38,6 +38,14 @@ class TestRedirectAllowlist:
             ("http://127.0.0.1:8080/cb", True),
             ("https://localhost:3000/cb", True),
             ("HTTPS://CLAUDE.AI/cb", True),
+            # exact third-party callbacks: byte-for-byte or nothing
+            ("https://www.cursor.com/agents/mcp/oauth/callback", True),
+            ("https://www.cursor.com/agents/mcp/oauth/callback?x=1", False),
+            ("https://www.cursor.com/agents/mcp/oauth/callback/", False),
+            ("https://www.cursor.com/other", False),
+            ("https://cursor.com/agents/mcp/oauth/callback", False),
+            ("http://www.cursor.com/agents/mcp/oauth/callback", False),
+            ("https://www.cursor.com.evil.com/agents/mcp/oauth/callback", False),
             # near-misses an attacker would actually try
             ("https://claude.ai.evil.com/cb", False),
             ("https://notclaude.ai/cb", False),

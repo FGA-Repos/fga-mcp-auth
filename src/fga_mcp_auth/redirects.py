@@ -27,13 +27,15 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from .constants import HTTPS_REDIRECT_DOMAINS, LOOPBACK_REDIRECT_HOSTS
+from .constants import EXACT_REDIRECT_URIS, HTTPS_REDIRECT_DOMAINS, LOOPBACK_REDIRECT_HOSTS
 
 
 def is_allowed_redirect(uri: str) -> bool:
     raw = str(uri)
     if "\\" in raw:
         return False
+    if raw in EXACT_REDIRECT_URIS:
+        return True
     parsed = urlparse(raw)
     host = (parsed.hostname or "").lower()
     scheme = (parsed.scheme or "").lower()

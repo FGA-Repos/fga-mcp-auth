@@ -44,6 +44,7 @@ from . import routes, tokens
 from .constants import (
     AUTH_CODE_TTL,
     MAX_CLIENTS,
+    MAX_PENDING,
     PENDING_TTL,
     SERVICE_CLIENT_ID,
     SERVICE_TOKEN_SEPARATOR,
@@ -318,7 +319,12 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
     # --- OAuthAuthorizationServerProvider protocol -------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+        client = self._clients.get(client_id)
+        if client is not None:
+            # LRU, not FIFO: a registration flood evicts idle clients, not the
+            # ones staff are actively connecting with.
+            self._clients.move_to_end(client_id)
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         # DCR is open, so the redirect allowlist is enforced HERE rather than at
@@ -372,6 +378,10 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
         # becomes a clean retryable /login failure rather than an exception
         # thrown inside the SDK's /authorize handler.
         self._prune()
+        # /authorize needs only a self-registered client_id, so bound the map.
+        # Dicts are insertion-ordered: this drops the oldest in-flight login.
+        while len(self._pending) >= MAX_PENDING:
+            self._pending.pop(next(iter(self._pending)))
         state_key = secrets.token_urlsafe(32)
         self._pending[state_key] = {
             "client_id": client.client_id,

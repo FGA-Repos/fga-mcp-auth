@@ -251,7 +251,8 @@ Each server also needs its Okta redirect URI registered on the shared app:
 * **Stdio is authless by design.** Never run a gated server over stdio with
   `MCP_TOOL_GATING` on: there is no auth context, so the gate denies everything.
 * **DCR is unauthenticated** (claude.ai needs it), so `/register` is an open
-  write primitive. The client registry is capped at 500 with FIFO eviction, and
+  write primitive. The client registry is capped at 500 with least-recently-used
+  eviction, in-flight logins are capped at 5000 (oldest dropped first), and
   rejected redirect URIs are logged by hostname only.
 * **Nothing user-supplied is reflected.** `/oauth/error` looks its reason up in
   a fixed table, and Okta's `error` parameter goes to the log rather than onto a

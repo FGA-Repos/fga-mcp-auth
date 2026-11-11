@@ -609,6 +609,34 @@ class TestPendingStateHygiene:
         assert "c25" in provider._clients
         assert f"c{MAX_CLIENTS + 24}" in provider._clients
 
+    async def test_a_client_in_use_survives_a_registration_flood(self):
+        """LRU, not FIFO: a flood of throwaway registrations must not evict the
+        client a staff member is actively connecting with."""
+        provider = make_provider()
+        for i in range(MAX_CLIENTS):
+            await provider.register_client(make_client(CLAUDE_REDIRECT, client_id=f"c{i}"))
+        assert await provider.get_client("c0") is not None
+        for i in range(25):
+            await provider.register_client(make_client(CLAUDE_REDIRECT, client_id=f"flood{i}"))
+        assert "c0" in provider._clients
+        assert "c1" not in provider._clients
+        assert len(provider._clients) == MAX_CLIENTS
+
+    async def test_pending_logins_are_capped_and_evict_oldest_first(self, monkeypatch):
+        """/authorize needs only a self-registered client_id, so `_pending` is an
+        open write primitive; TTL pruning alone does not bound it."""
+        import fga_mcp_auth.provider as provider_module
+
+        cap = 5
+        monkeypatch.setattr(provider_module, "MAX_PENDING", cap)
+        provider = make_provider()
+        states = [(await start_login(provider))[1] for _ in range(cap + 3)]
+        assert len(provider._pending) == cap
+        for gone in states[:3]:
+            assert gone not in provider._pending
+        for kept in states[3:]:
+            assert kept in provider._pending
+
     async def test_authorize_does_not_evict_registered_clients(self):
         """The short-lived maps get pruned on authorize(); registrations must not,
         or an idle connector would lose its client mid-session."""

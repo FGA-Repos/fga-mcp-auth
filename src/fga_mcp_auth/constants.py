@@ -63,10 +63,16 @@ OKTA_LOGIN_STATUSES = frozenset({"ACTIVE", "PASSWORD_EXPIRED"})
 # --- registry ---------------------------------------------------------------
 # DCR is unauthenticated by design (claude.ai has to be able to register), so the
 # client registry is an unbounded write primitive for anyone who can reach
-# /register. Cap it and evict oldest-first. shortcut: a flat FIFO cap — an LRU
-# keyed on last use would be kinder to long-idle connectors if we ever outgrow
-# this. Eviction is survivable: a dropped client re-registers on its next connect.
+# /register. Cap it and evict least-recently-used (get_client refreshes an
+# entry), so a registration flood drops idle clients rather than ones in active
+# use. Eviction is survivable: a dropped client re-registers on its next connect.
 MAX_CLIENTS = 500
+# In-flight logins (/authorize -> Okta -> /okta/callback). /authorize needs only
+# a self-registered client_id, so this is an open write primitive too. TTL
+# pruning alone does not bound it inside one PENDING_TTL window. The trade:
+# bounded memory, at the cost that a flood can evict a real in-flight login
+# (oldest first), which then fails as "invalid or expired" and is retried.
+MAX_PENDING = 5000
 
 # --- identity ---------------------------------------------------------------
 SERVICE_CLIENT_ID = "fga-service-token"  # synthetic client_id for the static bearer

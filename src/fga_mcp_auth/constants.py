@@ -5,17 +5,25 @@ picked a side). Changing any of these changes fleet-wide behavior."""
 from __future__ import annotations
 
 # --- redirect allowlist -----------------------------------------------------
-# Split by scheme policy: loopback hosts may be plain http (a local connector
-# has no cert), the public Claude hosts must be https. Loopback is matched
-# EXACTLY — `anything.localhost` and `anything.127.0.0.1` used to pass the old
-# suffix rule, which was over-broad for no benefit.
+# Loopback hosts may be plain http (a local connector has no cert) on any port
+# and path. Loopback is matched EXACTLY — `anything.localhost` and
+# `anything.127.0.0.1` used to pass the old suffix rule, which was over-broad for
+# no benefit.
 LOOPBACK_REDIRECT_HOSTS = frozenset({"localhost", "127.0.0.1"})
-HTTPS_REDIRECT_DOMAINS = frozenset({"claude.ai", "claude.com"})
-ALLOWED_REDIRECT_DOMAINS = LOOPBACK_REDIRECT_HOSTS | HTTPS_REDIRECT_DOMAINS
-# Third-party hosted clients get an EXACT URI, never a domain: a domain grant
-# would let any page on that host receive our auth codes. Cursor's cloud agent
-# (2026-10-16, Nick) is the first; local clients already pass via loopback.
-EXACT_REDIRECT_URIS = frozenset({"https://www.cursor.com/agents/mcp/oauth/callback"})
+# The only host-level grant left. Kept under its public name so consumer imports
+# do not break; claude.ai / claude.com moved to EXACT_REDIRECT_URIS in 1.3.0.
+ALLOWED_REDIRECT_DOMAINS = LOOPBACK_REDIRECT_HOSTS
+# Hosted clients get an EXACT URI, never a domain: a domain grant would let any
+# page on that host (or any subdomain) receive our auth codes. Claude's two
+# documented remote-connector callbacks, plus Cursor's cloud agent (2026-10-16,
+# Nick). Local clients pass via loopback.
+EXACT_REDIRECT_URIS = frozenset(
+    {
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+        "https://www.cursor.com/agents/mcp/oauth/callback",
+    }
+)
 
 # --- lifetimes --------------------------------------------------------------
 ACCESS_TTL = 3600  # 1h — short because stateless tokens can't be revoked

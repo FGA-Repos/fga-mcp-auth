@@ -25,6 +25,7 @@ from mcp.server.auth.provider import AuthorizationParams, RegistrationError
 from mcp.shared.auth import OAuthClientMetadata
 
 from fga_mcp_auth import ALLOWED_REDIRECT_DOMAINS, is_allowed_redirect
+from fga_mcp_auth.constants import EXACT_REDIRECT_URIS
 
 
 class TestRedirectAllowlist:
@@ -32,12 +33,18 @@ class TestRedirectAllowlist:
         "uri,allowed",
         [
             ("https://claude.ai/api/mcp/auth_callback", True),
-            ("https://foo.claude.ai/cb", True),
+            ("https://foo.claude.ai/cb", False),
             ("https://claude.com/api/mcp/auth_callback", True),
             ("http://localhost:3000/cb", True),
             ("http://127.0.0.1:8080/cb", True),
             ("https://localhost:3000/cb", True),
-            ("HTTPS://CLAUDE.AI/cb", True),
+            ("HTTPS://CLAUDE.AI/cb", False),
+            # Claude is pinned to its exact callbacks, like Cursor
+            ("https://claude.ai/public/artifacts/x", False),
+            ("https://claude.ai/api/mcp/auth_callback?x=1", False),
+            ("https://claude.ai/api/mcp/auth_callback/", False),
+            ("https://foo.claude.ai/api/mcp/auth_callback", False),
+            ("https://claude.com/some/other/page", False),
             # exact third-party callbacks: byte-for-byte or nothing
             ("https://www.cursor.com/agents/mcp/oauth/callback", True),
             ("https://www.cursor.com/agents/mcp/oauth/callback?x=1", False),
@@ -99,7 +106,8 @@ class TestRedirectAllowlistHardening:
         scheme on an allowed host passed."""
         assert is_allowed_redirect("http://claude.ai/cb") is False
         assert is_allowed_redirect("ftp://claude.ai/cb") is False
-        assert is_allowed_redirect("https://claude.ai/cb") is True
+        assert is_allowed_redirect("http://claude.ai/api/mcp/auth_callback") is False
+        assert is_allowed_redirect("https://claude.ai/api/mcp/auth_callback") is True
 
     def test_http_stays_allowed_on_loopback_only(self):
         """A local connector has no certificate; a public one has no excuse."""
@@ -108,7 +116,13 @@ class TestRedirectAllowlistHardening:
         assert is_allowed_redirect("http://claude.com/cb") is False
 
     def test_allowlist_membership_is_exactly_what_review_expects(self):
-        assert {"claude.ai", "claude.com", "localhost", "127.0.0.1"} == ALLOWED_REDIRECT_DOMAINS
+        """Only loopback is granted by host; every hosted client is an exact URI."""
+        assert {"localhost", "127.0.0.1"} == ALLOWED_REDIRECT_DOMAINS
+        assert {
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.com/api/mcp/auth_callback",
+            "https://www.cursor.com/agents/mcp/oauth/callback",
+        } == EXACT_REDIRECT_URIS
 
 
 class TestRedirectParserConfusion:

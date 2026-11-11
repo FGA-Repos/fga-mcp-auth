@@ -13,8 +13,11 @@ looked at the scheme:
     `anything.127.0.0.1` no longer pass. `.localhost` is reserved (RFC 6761) and
     no registrable TLD is all-numeric, so this was not exploitable; it was still
     broader than intended.
-  * https is REQUIRED for claude.ai / claude.com. http and exotic schemes
-    (`ftp:`) used to pass on an allowed host.
+  * hosted clients — claude.ai / claude.com included — must match an EXACT
+    callback URI (constants.EXACT_REDIRECT_URIS). The old predicate granted
+    those two as whole domains: any subdomain, any path, which made any page
+    under them a candidate receiver for our auth codes. http and exotic schemes
+    (`ftp:`) used to pass on an allowed host too.
   * a literal backslash anywhere in the URI is rejected outright. urlparse is
     RFC 3986, browsers are WHATWG, and they disagree about `\\` in the authority:
     `https://phish.example\\@claude.ai/` is host `claude.ai` to urlparse and host
@@ -27,7 +30,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from .constants import EXACT_REDIRECT_URIS, HTTPS_REDIRECT_DOMAINS, LOOPBACK_REDIRECT_HOSTS
+from .constants import EXACT_REDIRECT_URIS, LOOPBACK_REDIRECT_HOSTS
 
 
 def is_allowed_redirect(uri: str) -> bool:
@@ -43,6 +46,4 @@ def is_allowed_redirect(uri: str) -> bool:
         return False
     if host in LOOPBACK_REDIRECT_HOSTS:
         return scheme in ("http", "https")
-    if any(host == domain or host.endswith(f".{domain}") for domain in HTTPS_REDIRECT_DOMAINS):
-        return scheme == "https"
     return False

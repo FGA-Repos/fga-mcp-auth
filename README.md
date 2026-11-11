@@ -20,10 +20,11 @@ Enterprise Managed Auth grant, say) lands once instead of seven times.
 * Issues **stateless HS256 tokens** that carry the user's identity in their
   claims. Nothing is stored server-side, so a DO App Platform redeploy — which
   happens on every push — no longer logs every staff member out.
-* Enforces a **redirect allowlist at DCR registration** (claude.ai/claude.com,
-  loopback, plus exact URIs for named third-party clients such as Cursor's cloud
-  agent), keeps `/authorize` answering on our own origin, and never reflects
-  attacker-supplied text.
+* Enforces a **redirect allowlist at DCR registration** (Claude's exact
+  callbacks `https://claude.ai/api/mcp/auth_callback` and
+  `https://claude.com/api/mcp/auth_callback`, loopback, plus exact URIs for
+  named third-party clients such as Cursor's cloud agent), keeps `/authorize`
+  answering on our own origin, and never reflects attacker-supplied text.
 * Keeps the static **`MCP_BEARER_TOKEN` service path** working for socialbot,
   curl and CI.
 * Ships **per-user audit logging** (SDK 2.0) and an opt-in **per-tool group
@@ -60,7 +61,7 @@ Dockerfiles are `python:3.12-slim` with no git binary, and a tarball at a full
 commit SHA is immutable where a tag is not:
 
 ```
-# fga-mcp-auth v1.2.0
+# fga-mcp-auth v1.3.0
 fga-mcp-auth @ https://github.com/FGA-Repos/fga-mcp-auth/archive/<full-40-char-sha>.tar.gz
 ```
 
@@ -419,6 +420,21 @@ uv run --isolated --group dev --group sdk2 pytest    # mcp>=2
 wrong leg; everything else runs on both.
 
 ## Changelog
+
+### 1.3.0
+
+* **Security — Claude pinned to exact callbacks.** `claude.ai` / `claude.com`
+  were allowed as whole domains (any subdomain, any path). Only
+  `https://claude.ai/api/mcp/auth_callback` and
+  `https://claude.com/api/mcp/auth_callback` now pass, via
+  `EXACT_REDIRECT_URIS`. `ALLOWED_REDIRECT_DOMAINS` keeps its name but now holds
+  only the loopback hosts; `HTTPS_REDIRECT_DOMAINS` is gone. If Claude ever
+  registers another callback, the symptom is `invalid_redirect_uri` at
+  `/register` and the fix is one line in `EXACT_REDIRECT_URIS`.
+* **Hardening.** The client registry evicts least-recently-used instead of
+  FIFO, in-flight logins are capped at `MAX_PENDING` (5000), and Okta's
+  `error` / `iss` callback parameters are logged as a bounded `repr` so they
+  cannot forge log lines.
 
 ### 1.2.0
 

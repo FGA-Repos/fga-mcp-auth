@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 
 
 LOGIN_COOKIE_PREFIX = "fga_login_"
+CONSENT_COOKIE_PREFIX = "fga_consent_"
 CLIENT_NAME_MAX = 80
 
 # The consent page must not be cached, framed, or run script. No `form-action`:
@@ -87,6 +88,30 @@ CONSENT_HEADERS = {
 def login_cookie_name(state_key: str) -> str:
     """Per-login name, so two connectors set up at once do not clobber each other."""
     return LOGIN_COOKIE_PREFIX + hashlib.sha256(state_key.encode()).hexdigest()[:16]
+
+
+def consent_cookie_name(state_key: str) -> str:
+    """Set only on the consent POST's response: proof that this browser clicked."""
+    return CONSENT_COOKIE_PREFIX + hashlib.sha256(state_key.encode()).hexdigest()[:16]
+
+
+def _cookie_matches(request: Request, name: str, expected: str) -> bool:
+    got = request.cookies.get(name) or ""
+    if not expected or not got:
+        return False
+    return secrets.compare_digest(got.encode(), expected.encode())
+
+
+def _set_login_cookie(provider: FGAAuthProvider, resp: Response, name: str, value: str) -> None:
+    resp.set_cookie(
+        name,
+        value,
+        max_age=PENDING_TTL,
+        path="/",
+        secure=provider.settings.public_base_url.startswith("https://"),
+        httponly=True,
+        samesite="lax",
+    )
 
 
 def _browser_matches(request: Request, state_key: str, pending: dict) -> bool:
@@ -120,6 +145,15 @@ async def handle_login_get(provider: FGAAuthProvider, request: Request) -> Respo
         return pending
     if provider._okta is None:
         return _okta_unconfigured()
+    if pending.get("consented"):
+        # The page token is handed to any browser that loads this URL; once
+        # someone has clicked Continue, stop handing it out.
+        return HTMLResponse(
+            error_html(
+                "This sign-in has already been approved. Start again from your application."
+            ),
+            status_code=400,
+        )
 
     if not pending.get("browser"):
         pending["browser"] = secrets.token_urlsafe(32)
@@ -136,15 +170,7 @@ async def handle_login_get(provider: FGAAuthProvider, request: Request) -> Respo
         ),
         headers=CONSENT_HEADERS,
     )
-    resp.set_cookie(
-        login_cookie_name(state_key),
-        pending["browser"],
-        max_age=PENDING_TTL,
-        path="/",
-        secure=provider.settings.public_base_url.startswith("https://"),
-        httponly=True,
-        samesite="lax",
-    )
+    _set_login_cookie(provider, resp, login_cookie_name(state_key), pending["browser"])
     return resp
 
 
@@ -166,10 +192,15 @@ async def handle_login_post(provider: FGAAuthProvider, request: Request) -> Resp
             error_html("This sign-in was started in a different browser."), status_code=400
         )
 
+    # A fresh secret only the clicking browser receives. The page token above
+    # reaches every browser that loaded the page, so it cannot prove the click.
     pending["consented"] = True
+    pending["consent"] = secrets.token_urlsafe(32)
     challenge = provider.pkce_challenge(pending["okta_verifier"])
     url = await provider._okta.authorize_url(state_key, pending["okta_nonce"], challenge)
-    return RedirectResponse(url=url, status_code=303)
+    resp = RedirectResponse(url=url, status_code=303)
+    _set_login_cookie(provider, resp, consent_cookie_name(state_key), pending["consent"])
+    return resp
 
 
 async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> Response:
@@ -183,7 +214,9 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
     # clicked Continue on our consent page. Otherwise answer on our origin,
     # mint nothing, and leave the pending login alone — a stranger holding only
     # the state must not be able to burn it.
-    if not pending.get("consented") or not _browser_matches(request, state_key, pending):
+    if not pending.get("consented") or not _cookie_matches(
+        request, consent_cookie_name(state_key), pending.get("consent") or ""
+    ):
         logger.warning(
             "Okta callback without consent from this browser",
             extra={"event_category": "auth.failure"},
@@ -191,12 +224,13 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
         return HTMLResponse(
             error_html("This sign-in was not approved in this browser."), status_code=400
         )
-    cookie = login_cookie_name(state_key)
+    cookies = (login_cookie_name(state_key), consent_cookie_name(state_key))
 
     def fail(error: str) -> Response:
         provider._pending.pop(state_key, None)
         resp = error_redirect(pending, error)
-        resp.delete_cookie(cookie, path="/")
+        for name in cookies:
+            resp.delete_cookie(name, path="/")
         return resp
 
     if error := params.get("error"):
@@ -257,7 +291,8 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
     if pending["original_state"]:
         out["state"] = pending["original_state"]
     resp = RedirectResponse(url=append_params(pending["redirect_uri"], out), status_code=302)
-    resp.delete_cookie(cookie, path="/")
+    for name in cookies:
+        resp.delete_cookie(name, path="/")
     return resp
 
 

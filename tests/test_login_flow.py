@@ -33,6 +33,7 @@ from conftest import (
     SECRET,
     SERVICE_TOKEN,
     USER,
+    consent,
     decode,
     fake_request,
     make_client,
@@ -53,7 +54,7 @@ from mcp.shared.auth import OAuthClientInformationFull
 
 from fga_mcp_auth import ACCESS_TTL, AUTH_CODE_TTL, MAX_CLIENTS
 from fga_mcp_auth.constants import REDIRECT_ERRORS
-from fga_mcp_auth.routes import login_cookie_name
+from fga_mcp_auth.routes import consent_cookie_name, login_cookie_name
 
 
 class TestLoginHop:
@@ -236,6 +237,30 @@ class TestConsentAndBrowserBinding:
             assert "location" not in {k.lower() for k in resp.headers}
             assert not provider._pending[state].get("consented")
 
+    async def test_a_browser_that_only_viewed_the_page_cannot_finish(self, provider):
+        # The attacker loads the page and clicks Continue; the victim's browser
+        # was only made to load the page (it holds the page token) and is then
+        # sent through Okta. Its callback must not count as consent.
+        _, state = await start_login(provider, give_consent=False)
+        viewer = set_cookies(await provider.handle_login_get(fake_request(state=state, cookies={})))
+        assert login_cookie_name(state) in viewer
+        clicker = await consent(provider, state)
+        assert consent_cookie_name(state) in clicker
+        assert consent_cookie_name(state) not in viewer
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, code="okta-code", cookies=viewer)
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert provider._auth_codes == {}
+        assert state in provider._pending
+
+    async def test_consent_page_is_not_reissued_after_consent(self, provider):
+        _, state = await start_login(provider)
+        resp = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        assert resp.status_code == 400
+        assert "set-cookie" not in {k.lower() for k in resp.headers}
+
     async def test_login_post_with_an_unknown_state_is_refused(self, provider):
         resp = await provider.handle_login_post(
             fake_request(method="POST", form={"state": "made-up"}, cookies={})
@@ -245,9 +270,10 @@ class TestConsentAndBrowserBinding:
     async def test_a_finished_login_clears_its_cookie(self, provider):
         _, state = await start_login(provider)
         resp, _ = await run_callback(provider, state)
-        cleared = resp.headers["set-cookie"]
-        assert login_cookie_name(state) in cleared
-        assert "max-age=0" in cleared.lower()
+        cleared = set_cookies(resp)
+        assert cleared[login_cookie_name(state)] == ""
+        assert cleared[consent_cookie_name(state)] == ""
+        assert "max-age=0" in resp.headers["set-cookie"].lower()
 
 
 class TestOktaCallbackHappyPath:

@@ -266,6 +266,7 @@ async def consent(provider: FGAAuthProvider, state: str) -> dict[str, str]:
         fake_request(method="POST", form={"state": state}, cookies=cookies)
     )
     assert resp.status_code == 303, resp.status_code
+    cookies = {**cookies, **set_cookies(resp)}
     COOKIE_JAR[state] = cookies
     return cookies
 

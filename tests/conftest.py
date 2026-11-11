@@ -233,6 +233,7 @@ def fake_request(
     cookies: dict[str, str] | None = None,
     form: dict[str, str] | None = None,
     method: str = "GET",
+    headers: dict[str, str] | None = None,
     **query_params,
 ) -> SimpleNamespace:
     """Minimal stand-in for a Starlette Request: query_params, cookies, method,
@@ -245,7 +246,10 @@ def fake_request(
     async def body() -> bytes:
         return raw
 
-    return SimpleNamespace(query_params=query_params, cookies=cookies, method=method, body=body)
+    hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+    return SimpleNamespace(
+        query_params=query_params, cookies=cookies, method=method, body=body, headers=hdrs
+    )
 
 
 def set_cookies(resp) -> dict[str, str]:
@@ -379,7 +383,17 @@ async def assert_consent_over_http(app, provider: FGAAuthProvider) -> None:
     assert 'action="/login"' in page.text
     refused = stranger.post("/login", data={"state": state}, follow_redirects=False)
     assert refused.status_code == 400
-    resp = browser.post("/login", data={"state": state}, follow_redirects=False)
+    foreign = browser.post(
+        "/login",
+        data={"state": state},
+        headers={"Origin": "https://evil.example"},
+        follow_redirects=False,
+    )
+    assert foreign.status_code == 400
+    assert not provider._pending[state].get("consented")
+    resp = browser.post(
+        "/login", data={"state": state}, headers={"Origin": BASE}, follow_redirects=False
+    )
     assert resp.status_code == 303
     assert resp.headers["location"].startswith(OKTA_META["authorization_endpoint"])
     assert provider._pending[state]["consented"] is True

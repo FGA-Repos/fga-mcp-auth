@@ -122,6 +122,21 @@ def _browser_matches(request: Request, state_key: str, pending: dict) -> bool:
     return secrets.compare_digest(got.encode(), expected.encode())
 
 
+def _same_origin(provider: FGAAuthProvider, request: Request) -> bool:
+    """Refuse a consent POST another site submitted. SameSite=Lax still sends
+    our cookie on a top-level POST from a sibling subdomain, so check what the
+    browser says about the request's origin. Absent headers pass: old browsers
+    and non-browser clients send neither, and those cannot ride a victim's
+    cookie anyway."""
+    base = urlparse(provider.settings.public_base_url)
+    ours = f"{base.scheme}://{base.netloc}"
+    origin = request.headers.get("origin")
+    if origin is not None and origin != ours:
+        return False
+    site = request.headers.get("sec-fetch-site")
+    return site is None or site == "same-origin"
+
+
 def _okta_unconfigured() -> Response:
     # No fallback login path exists. In production this is unreachable —
     # require_http_complete() refuses to boot without Okta — so it only shows
@@ -183,6 +198,15 @@ async def handle_login_post(provider: FGAAuthProvider, request: Request) -> Resp
         return pending
     if provider._okta is None:
         return _okta_unconfigured()
+    if not _same_origin(provider, request):
+        logger.warning(
+            "Consent POST from another origin",
+            extra={"event_category": "auth.failure"},
+        )
+        return HTMLResponse(
+            error_html("This sign-in must be continued from this server's own page."),
+            status_code=400,
+        )
     if not _browser_matches(request, state_key, pending):
         logger.warning(
             "Consent POST without this login's browser cookie",

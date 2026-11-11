@@ -128,6 +128,47 @@ class TestConsentAndBrowserBinding:
     human now sees where the code will go and clicks Continue, and the callback
     is accepted only from the browser that clicked."""
 
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Origin": "https://evil.example"},
+            {"Origin": f"https://other.{BASE.split('://', 1)[1]}"},
+            {"Origin": BASE.replace("https://", "http://")},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "same-site"},
+            {"Origin": BASE, "Sec-Fetch-Site": "cross-site"},
+        ],
+    )
+    async def test_login_post_from_another_origin_is_refused(self, provider, headers):
+        """A sibling subdomain can set our page cookie (GET /login) and then
+        auto-submit a top-level POST; SameSite=Lax sends the cookie along. The
+        browser's Origin / Sec-Fetch-Site headers give it away."""
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(
+                method="POST", form={"state": state}, cookies=set_cookies(page), headers=headers
+            )
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert "set-cookie" not in {k.lower() for k in resp.headers}
+        assert not provider._pending[state].get("consented")
+
+    async def test_login_post_with_our_origin_redirects(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(
+                method="POST",
+                form={"state": state},
+                cookies=set_cookies(page),
+                headers={"Origin": BASE, "Sec-Fetch-Site": "same-origin"},
+            )
+        )
+        assert resp.status_code == 303
+        assert provider._pending[state]["consented"] is True
+
     async def test_login_get_shows_consent_and_does_not_redirect(self, provider):
         local = "http://localhost:33418/oauth/callback"
         client = OAuthClientInformationFull(

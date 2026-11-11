@@ -61,8 +61,11 @@ def wire_sdk1(mcp: Any, settings: Settings) -> FGAAuthProvider:
         allowed_hosts=[settings.allowed_host] if settings.allowed_host else [],
     )
 
-    @mcp.custom_route("/login", methods=["GET"])
-    async def _login_get(request):
+    # GET renders the consent page; POST is the consent click (state only).
+    @mcp.custom_route("/login", methods=["GET", "POST"])
+    async def _login(request):
+        if request.method == "POST":
+            return await provider.handle_login_post(request)
         return await provider.handle_login_get(request)
 
     @mcp.custom_route("/okta/callback", methods=["GET"])

@@ -9,8 +9,9 @@ the live Okta deployment), re-homed to package imports.
 from __future__ import annotations
 
 import time
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 import jwt
@@ -213,9 +214,65 @@ def redirect_params(resp) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(urlparse(resp.headers["location"]).query).items()}
 
 
-def fake_request(**query_params) -> SimpleNamespace:
-    """Minimal stand-in for a Starlette Request — handlers only read query_params."""
-    return SimpleNamespace(query_params=query_params)
+# The browser's cookie jar, keyed by our pending state: what start_login's
+# consent click left behind. fake_request attaches it by default, so a callback
+# driven directly by a test arrives from the browser that consented — exactly as
+# Okta's redirect does in production. Pass cookies={} to arrive from elsewhere.
+COOKIE_JAR: dict[str, dict[str, str]] = {}
+
+
+@pytest.fixture(autouse=True)
+def _clean_cookie_jar():
+    COOKIE_JAR.clear()
+    yield
+    COOKIE_JAR.clear()
+
+
+def fake_request(
+    *,
+    cookies: dict[str, str] | None = None,
+    form: dict[str, str] | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    **query_params,
+) -> SimpleNamespace:
+    """Minimal stand-in for a Starlette Request: query_params, cookies, method,
+    and an urlencoded body() for the consent POST."""
+    if cookies is None:
+        state = query_params.get("state") or (form or {}).get("state", "")
+        cookies = dict(COOKIE_JAR.get(state, {}))
+    raw = urlencode(form or {}).encode()
+
+    async def body() -> bytes:
+        return raw
+
+    hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+    return SimpleNamespace(
+        query_params=query_params, cookies=cookies, method=method, body=body, headers=hdrs
+    )
+
+
+def set_cookies(resp) -> dict[str, str]:
+    """name -> value for every Set-Cookie on a response."""
+    jar = SimpleCookie()
+    for header in resp.headers.getlist("set-cookie"):
+        jar.load(header)
+    return {name: morsel.value for name, morsel in jar.items()}
+
+
+async def consent(provider: FGAAuthProvider, state: str) -> dict[str, str]:
+    """GET the consent page, then POST Continue from the same browser.
+    Returns that browser's cookies (also stored in COOKIE_JAR)."""
+    page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+    assert page.status_code == 200, page.status_code
+    cookies = set_cookies(page)
+    resp = await provider.handle_login_post(
+        fake_request(method="POST", form={"state": state}, cookies=cookies)
+    )
+    assert resp.status_code == 303, resp.status_code
+    cookies = {**cookies, **set_cookies(resp)}
+    COOKIE_JAR[state] = cookies
+    return cookies
 
 
 def mint_raw(secret: str, *, audience: str = SLUG, issuer: str = BASE, **claims) -> str:
@@ -250,8 +307,10 @@ async def start_login(
     *,
     redirect_uri: str = CLAUDE_REDIRECT,
     state: str | None = "claude-state",
+    give_consent: bool = True,
 ) -> tuple[OAuthClientInformationFull, str]:
-    """register -> /authorize. Returns (client, our pending state key)."""
+    """register -> /authorize -> consent page -> Continue (unless give_consent is
+    False, or Okta is unconfigured). Returns (client, our pending state key)."""
     client = make_client(redirect_uri)
     await provider.register_client(client)
     target = await provider.authorize(
@@ -265,7 +324,10 @@ async def start_login(
         ),
     )
     assert target.startswith("/login?"), target
-    return client, parse_qs(urlparse(target).query)["state"][0]
+    pending_state = parse_qs(urlparse(target).query)["state"][0]
+    if give_consent and provider._okta is not None:
+        await consent(provider, pending_state)
+    return client, pending_state
 
 
 async def run_callback(
@@ -303,3 +365,35 @@ async def complete_login(provider: FGAAuthProvider):
 @pytest.fixture
 def provider():
     return make_provider()
+
+
+async def assert_consent_over_http(app, provider: FGAAuthProvider) -> None:
+    """The consent step through a real Starlette app and cookie jar: GET renders
+    the page and sets the cookie, a POST from that browser 303s to Okta, and a
+    POST from a browser without the cookie is refused on our origin."""
+    from starlette.testclient import TestClient
+
+    provider._okta._meta = dict(OKTA_META)
+    _client, state = await start_login(provider, give_consent=False)
+    # No `with`: the custom routes need no lifespan, and the session manager's
+    # lifespan can run only once per app.
+    browser, stranger = TestClient(app, base_url=BASE), TestClient(app, base_url=BASE)
+    page = browser.get(f"/login?state={state}", follow_redirects=False)
+    assert page.status_code == 200
+    assert 'action="/login"' in page.text
+    refused = stranger.post("/login", data={"state": state}, follow_redirects=False)
+    assert refused.status_code == 400
+    foreign = browser.post(
+        "/login",
+        data={"state": state},
+        headers={"Origin": "https://evil.example"},
+        follow_redirects=False,
+    )
+    assert foreign.status_code == 400
+    assert not provider._pending[state].get("consented")
+    resp = browser.post(
+        "/login", data={"state": state}, headers={"Origin": BASE}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith(OKTA_META["authorization_endpoint"])
+    assert provider._pending[state]["consented"] is True

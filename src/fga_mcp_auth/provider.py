@@ -6,7 +6,8 @@ Flow:
    are allowlist-checked HERE, see register_client)
 3. Claude redirects the user to GET /authorize -> we stash the request and
    return the relative URL /login?state=...
-4. GET /login 302s to Okta's authorize endpoint (PKCE S256 + nonce + state)
+4. GET /login renders a consent page and sets a browser-binding cookie; the
+   POST it submits 303s to Okta's authorize endpoint (PKCE S256 + nonce + state)
 5. Okta sends the user back to GET /okta/callback; we exchange the code,
    validate the id_token against Okta's JWKS, then issue our auth code and
    redirect to Claude's callback
@@ -44,6 +45,7 @@ from . import routes, tokens
 from .constants import (
     AUTH_CODE_TTL,
     MAX_CLIENTS,
+    MAX_PENDING,
     PENDING_TTL,
     SERVICE_CLIENT_ID,
     SERVICE_TOKEN_SEPARATOR,
@@ -318,7 +320,12 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
     # --- OAuthAuthorizationServerProvider protocol -------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+        client = self._clients.get(client_id)
+        if client is not None:
+            # LRU, not FIFO: a registration flood evicts idle clients, not the
+            # ones staff are actively connecting with.
+            self._clients.move_to_end(client_id)
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         # DCR is open, so the redirect allowlist is enforced HERE rather than at
@@ -338,8 +345,8 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
                 )
                 raise RegistrationError(
                     "invalid_redirect_uri",
-                    "redirect_uri must be https on claude.ai or claude.com, "
-                    "http/https on localhost, or an allowlisted client callback.",
+                    "redirect_uri must be an allowlisted client callback "
+                    "(Claude, Cursor) or http/https on localhost.",
                 )
         self._clients[client_info.client_id] = client_info
         while len(self._clients) > MAX_CLIENTS:
@@ -372,6 +379,10 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
         # becomes a clean retryable /login failure rather than an exception
         # thrown inside the SDK's /authorize handler.
         self._prune()
+        # /authorize needs only a self-registered client_id, so bound the map.
+        # Dicts are insertion-ordered: this drops the oldest in-flight login.
+        while len(self._pending) >= MAX_PENDING:
+            self._pending.pop(next(iter(self._pending)))
         state_key = secrets.token_urlsafe(32)
         self._pending[state_key] = {
             "client_id": client.client_id,
@@ -537,6 +548,9 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
 
     async def handle_login_get(self, request: Request) -> Response:
         return await routes.handle_login_get(self, request)
+
+    async def handle_login_post(self, request: Request) -> Response:
+        return await routes.handle_login_post(self, request)
 
     async def handle_okta_callback(self, request: Request) -> Response:
         return await routes.handle_okta_callback(self, request)

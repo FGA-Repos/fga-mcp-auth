@@ -30,7 +30,7 @@ from .redirects import is_allowed_redirect
 from .settings import OktaConfig, Settings
 from .tokens import InvalidTokenFormat
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 _LAZY = {
     "wire_sdk1": ("fga_mcp_auth.wiring.sdk1", "wire_sdk1"),

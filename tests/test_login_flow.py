@@ -18,10 +18,13 @@ import logging
 import time
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
+import respx
 from conftest import (
     BASE,
     CLAUDE_REDIRECT,
+    COOKIE_JAR,
     HOSTILE,
     OKTA_CLIENT_ID,
     OKTA_ISSUER,
@@ -30,6 +33,7 @@ from conftest import (
     SECRET,
     SERVICE_TOKEN,
     USER,
+    consent,
     decode,
     fake_request,
     make_client,
@@ -37,6 +41,7 @@ from conftest import (
     make_provider,
     redirect_params,
     run_callback,
+    set_cookies,
     start_login,
 )
 from mcp.server.auth.provider import (
@@ -45,20 +50,26 @@ from mcp.server.auth.provider import (
     RegistrationError,
     TokenError,
 )
+from mcp.shared.auth import OAuthClientInformationFull
 
 from fga_mcp_auth import ACCESS_TTL, AUTH_CODE_TTL, MAX_CLIENTS
 from fga_mcp_auth.constants import REDIRECT_ERRORS
+from fga_mcp_auth.routes import consent_cookie_name, login_cookie_name
 
 
 class TestLoginHop:
     """D4. authorize() returns a RELATIVE /login URL and a dedicated route does
     the Okta redirect, so no external HTTP happens inside the SDK's /authorize
-    handler and the 302 target can never be foreign."""
+    handler and the redirect target can never be foreign. Since 1.3.0 the hop
+    goes through a consent page: GET renders it, the POST Continue goes to Okta."""
 
-    async def test_login_redirects_to_okta_with_pkce_and_nonce(self, provider):
-        _, state = await start_login(provider)
-        resp = await provider.handle_login_get(fake_request(state=state))
-        assert resp.status_code == 302
+    async def test_login_post_with_cookie_redirects_to_okta_with_pkce_and_nonce(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(method="POST", form={"state": state}, cookies=set_cookies(page))
+        )
+        assert resp.status_code == 303
         url = urlparse(resp.headers["location"])
         assert f"{url.scheme}://{url.netloc}{url.path}" == OKTA_META["authorization_endpoint"]
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -75,13 +86,14 @@ class TestLoginHop:
         assert q["code_challenge"] == expected.decode()
 
     async def test_login_is_replayable_without_reminting_secrets(self, provider):
-        """Refreshing /login must reuse the stashed verifier/nonce, not rotate
-        them — rotating would strand the in-flight Okta round-trip."""
-        _, state = await start_login(provider)
+        """Refreshing /login must reuse the stashed verifier/nonce and browser
+        token, not rotate them — rotating would strand the in-flight round-trip."""
+        _, state = await start_login(provider, give_consent=False)
         first = provider._pending[state]["okta_verifier"]
-        await provider.handle_login_get(fake_request(state=state))
-        await provider.handle_login_get(fake_request(state=state))
+        one = set_cookies(await provider.handle_login_get(fake_request(state=state)))
+        two = set_cookies(await provider.handle_login_get(fake_request(state=state)))
         assert provider._pending[state]["okta_verifier"] == first
+        assert one == two
 
     async def test_unknown_state_rejected(self, provider):
         assert (await provider.handle_login_get(fake_request(state="made-up"))).status_code == 400
@@ -102,9 +114,207 @@ class TestLoginHop:
         state cannot be reached."""
         no_okta = make_provider(okta=False)
         _, state = await start_login(no_okta)
-        resp = await no_okta.handle_login_get(fake_request(state=state))
-        assert resp.status_code == 503
-        assert "password" not in resp.body.decode().lower()
+        for resp in (
+            await no_okta.handle_login_get(fake_request(state=state)),
+            await no_okta.handle_login_post(fake_request(method="POST", form={"state": state})),
+        ):
+            assert resp.status_code == 503
+            assert "password" not in resp.body.decode().lower()
+
+
+class TestConsentAndBrowserBinding:
+    """F1. DCR is open, so the client asking for a staff member's code may be an
+    attacker's, and with a live Okta session the chain used to be silent. The
+    human now sees where the code will go and clicks Continue, and the callback
+    is accepted only from the browser that clicked."""
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Origin": "https://evil.example"},
+            {"Origin": f"https://other.{BASE.split('://', 1)[1]}"},
+            {"Origin": BASE.replace("https://", "http://")},
+            {"Origin": "null"},
+            {"Sec-Fetch-Site": "same-site"},
+            {"Origin": BASE, "Sec-Fetch-Site": "cross-site"},
+        ],
+    )
+    async def test_login_post_from_another_origin_is_refused(self, provider, headers):
+        """A sibling subdomain can set our page cookie (GET /login) and then
+        auto-submit a top-level POST; SameSite=Lax sends the cookie along. The
+        browser's Origin / Sec-Fetch-Site headers give it away."""
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(
+                method="POST", form={"state": state}, cookies=set_cookies(page), headers=headers
+            )
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert "set-cookie" not in {k.lower() for k in resp.headers}
+        assert not provider._pending[state].get("consented")
+
+    async def test_login_post_with_our_origin_redirects(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(
+                method="POST",
+                form={"state": state},
+                cookies=set_cookies(page),
+                headers={"Origin": BASE, "Sec-Fetch-Site": "same-origin"},
+            )
+        )
+        assert resp.status_code == 303
+        assert provider._pending[state]["consented"] is True
+
+    async def test_login_get_shows_consent_and_does_not_redirect(self, provider):
+        local = "http://localhost:33418/oauth/callback"
+        client = OAuthClientInformationFull(
+            client_id="named",
+            client_name="<script>x</script>",
+            redirect_uris=[local],
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        await provider.register_client(client)
+        target = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="c" * 43,
+                redirect_uri=local,
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        state = parse_qs(urlparse(target).query)["state"][0]
+        resp = await provider.handle_login_get(fake_request(state=state))
+        assert resp.status_code == 200
+        assert "location" not in {k.lower() for k in resp.headers}
+        body = resp.body.decode()
+        assert "http://localhost:33418" in body
+        assert "<script>x</script>" not in body
+        assert "&lt;script&gt;x&lt;/script&gt;" in body
+        cookie = resp.headers["set-cookie"]
+        assert "httponly" in cookie.lower()
+        assert "samesite=lax" in cookie.lower()
+        assert "secure" in cookie.lower()  # our public origin is https
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+        assert "form-action" not in resp.headers["content-security-policy"]
+        assert resp.headers["cache-control"] == "no-store"
+
+    async def test_a_long_client_name_is_truncated(self, provider):
+        client = OAuthClientInformationFull(
+            client_id="long",
+            client_name="A" * 500,
+            redirect_uris=[CLAUDE_REDIRECT],
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        await provider.register_client(client)
+        target = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="c" * 43,
+                redirect_uri=CLAUDE_REDIRECT,
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        state = parse_qs(urlparse(target).query)["state"][0]
+        body = (await provider.handle_login_get(fake_request(state=state))).body.decode()
+        assert "A" * 81 not in body
+
+    async def test_two_logins_get_different_cookie_names(self, provider):
+        _, one = await start_login(provider)
+        _, two = await start_login(provider)
+        assert set(COOKIE_JAR[one]) != set(COOKIE_JAR[two])
+
+    async def test_callback_without_consent_issues_no_code(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        await provider.handle_login_get(fake_request(state=state))  # page seen, no click
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, code="okta-code", cookies={})
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert provider._auth_codes == {}
+        assert state in provider._pending  # a stranger cannot burn the login
+
+    async def test_callback_from_a_browser_without_the_cookie_is_refused(self, provider):
+        _, state = await start_login(provider)  # consent given in another jar
+        for cookies in ({}, {login_cookie_name(state): "not-the-token"}):
+            with respx.mock:
+                route = respx.post(OKTA_META["token_endpoint"]).mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={
+                            "id_token": make_id_token(nonce=provider._pending[state]["okta_nonce"])
+                        },
+                    )
+                )
+                resp = await provider.handle_okta_callback(
+                    fake_request(state=state, code="okta-code", cookies=cookies)
+                )
+            assert resp.status_code == 400
+            assert "location" not in {k.lower() for k in resp.headers}
+            assert not route.called  # the Okta code is not spent
+            assert provider._auth_codes == {}
+            assert state in provider._pending
+        # The consenting browser can still finish.
+        ok, _ = await run_callback(provider, state)
+        assert ok.status_code == 302 and "code" in redirect_params(ok)
+
+    async def test_login_post_without_cookie_is_refused(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        await provider.handle_login_get(fake_request(state=state))
+        for cookies in ({}, {login_cookie_name(state): "forged"}):
+            resp = await provider.handle_login_post(
+                fake_request(method="POST", form={"state": state}, cookies=cookies)
+            )
+            assert resp.status_code == 400
+            assert "location" not in {k.lower() for k in resp.headers}
+            assert not provider._pending[state].get("consented")
+
+    async def test_a_browser_that_only_viewed_the_page_cannot_finish(self, provider):
+        # The attacker loads the page and clicks Continue; the victim's browser
+        # was only made to load the page (it holds the page token) and is then
+        # sent through Okta. Its callback must not count as consent.
+        _, state = await start_login(provider, give_consent=False)
+        viewer = set_cookies(await provider.handle_login_get(fake_request(state=state, cookies={})))
+        assert login_cookie_name(state) in viewer
+        clicker = await consent(provider, state)
+        assert consent_cookie_name(state) in clicker
+        assert consent_cookie_name(state) not in viewer
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, code="okta-code", cookies=viewer)
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert provider._auth_codes == {}
+        assert state in provider._pending
+
+    async def test_consent_page_is_not_reissued_after_consent(self, provider):
+        _, state = await start_login(provider)
+        resp = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        assert resp.status_code == 400
+        assert "set-cookie" not in {k.lower() for k in resp.headers}
+
+    async def test_login_post_with_an_unknown_state_is_refused(self, provider):
+        resp = await provider.handle_login_post(
+            fake_request(method="POST", form={"state": "made-up"}, cookies={})
+        )
+        assert resp.status_code == 400
+
+    async def test_a_finished_login_clears_its_cookie(self, provider):
+        _, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state)
+        cleared = set_cookies(resp)
+        assert cleared[login_cookie_name(state)] == ""
+        assert cleared[consent_cookie_name(state)] == ""
+        assert "max-age=0" in resp.headers["set-cookie"].lower()
 
 
 class TestOktaCallbackHappyPath:
@@ -532,6 +742,36 @@ class TestCallbackErrorReflection:
         assert q["error"] in REDIRECT_ERRORS
         assert "code" not in q  # no query smuggling through the error string
 
+    async def test_okta_error_param_cannot_forge_a_log_line(self, caplog):
+        """Anyone holding a pending state can choose `error`, and a plain-text
+        log formatter would turn a raw newline into a second, forged record."""
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await provider.handle_okta_callback(
+                fake_request(state=state, error="x\nERROR forged line")
+            )
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages and not any("\n" in m for m in messages)
+        assert any("ERROR forged line" in m for m in messages)  # still there, escaped
+
+    async def test_a_huge_okta_error_param_is_logged_bounded(self, caplog):
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await provider.handle_okta_callback(fake_request(state=state, error="A" * 5000))
+        assert caplog.records
+        assert all(len(r.getMessage()) < 400 for r in caplog.records)
+
+    async def test_a_mismatched_iss_cannot_forge_a_log_line(self, caplog):
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await run_callback(provider, state, iss="https://evil.example\nERROR forged")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Issuer mismatch" in m for m in messages)
+        assert not any("\n" in m for m in messages)
+
 
 class TestPendingStateHygiene:
     async def test_state_key_is_high_entropy_and_unique(self):
@@ -578,6 +818,34 @@ class TestPendingStateHygiene:
         assert "c24" not in provider._clients
         assert "c25" in provider._clients
         assert f"c{MAX_CLIENTS + 24}" in provider._clients
+
+    async def test_a_client_in_use_survives_a_registration_flood(self):
+        """LRU, not FIFO: a flood of throwaway registrations must not evict the
+        client a staff member is actively connecting with."""
+        provider = make_provider()
+        for i in range(MAX_CLIENTS):
+            await provider.register_client(make_client(CLAUDE_REDIRECT, client_id=f"c{i}"))
+        assert await provider.get_client("c0") is not None
+        for i in range(25):
+            await provider.register_client(make_client(CLAUDE_REDIRECT, client_id=f"flood{i}"))
+        assert "c0" in provider._clients
+        assert "c1" not in provider._clients
+        assert len(provider._clients) == MAX_CLIENTS
+
+    async def test_pending_logins_are_capped_and_evict_oldest_first(self, monkeypatch):
+        """/authorize needs only a self-registered client_id, so `_pending` is an
+        open write primitive; TTL pruning alone does not bound it."""
+        import fga_mcp_auth.provider as provider_module
+
+        cap = 5
+        monkeypatch.setattr(provider_module, "MAX_PENDING", cap)
+        provider = make_provider()
+        states = [(await start_login(provider))[1] for _ in range(cap + 3)]
+        assert len(provider._pending) == cap
+        for gone in states[:3]:
+            assert gone not in provider._pending
+        for kept in states[3:]:
+            assert kept in provider._pending
 
     async def test_authorize_does_not_evict_registered_clients(self):
         """The short-lived maps get pruned on authorize(); registrations must not,

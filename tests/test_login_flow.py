@@ -18,10 +18,13 @@ import logging
 import time
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
+import respx
 from conftest import (
     BASE,
     CLAUDE_REDIRECT,
+    COOKIE_JAR,
     HOSTILE,
     OKTA_CLIENT_ID,
     OKTA_ISSUER,
@@ -37,6 +40,7 @@ from conftest import (
     make_provider,
     redirect_params,
     run_callback,
+    set_cookies,
     start_login,
 )
 from mcp.server.auth.provider import (
@@ -45,20 +49,26 @@ from mcp.server.auth.provider import (
     RegistrationError,
     TokenError,
 )
+from mcp.shared.auth import OAuthClientInformationFull
 
 from fga_mcp_auth import ACCESS_TTL, AUTH_CODE_TTL, MAX_CLIENTS
 from fga_mcp_auth.constants import REDIRECT_ERRORS
+from fga_mcp_auth.routes import login_cookie_name
 
 
 class TestLoginHop:
     """D4. authorize() returns a RELATIVE /login URL and a dedicated route does
     the Okta redirect, so no external HTTP happens inside the SDK's /authorize
-    handler and the 302 target can never be foreign."""
+    handler and the redirect target can never be foreign. Since 1.3.0 the hop
+    goes through a consent page: GET renders it, the POST Continue goes to Okta."""
 
-    async def test_login_redirects_to_okta_with_pkce_and_nonce(self, provider):
-        _, state = await start_login(provider)
-        resp = await provider.handle_login_get(fake_request(state=state))
-        assert resp.status_code == 302
+    async def test_login_post_with_cookie_redirects_to_okta_with_pkce_and_nonce(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        page = await provider.handle_login_get(fake_request(state=state, cookies={}))
+        resp = await provider.handle_login_post(
+            fake_request(method="POST", form={"state": state}, cookies=set_cookies(page))
+        )
+        assert resp.status_code == 303
         url = urlparse(resp.headers["location"])
         assert f"{url.scheme}://{url.netloc}{url.path}" == OKTA_META["authorization_endpoint"]
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -75,13 +85,14 @@ class TestLoginHop:
         assert q["code_challenge"] == expected.decode()
 
     async def test_login_is_replayable_without_reminting_secrets(self, provider):
-        """Refreshing /login must reuse the stashed verifier/nonce, not rotate
-        them — rotating would strand the in-flight Okta round-trip."""
-        _, state = await start_login(provider)
+        """Refreshing /login must reuse the stashed verifier/nonce and browser
+        token, not rotate them — rotating would strand the in-flight round-trip."""
+        _, state = await start_login(provider, give_consent=False)
         first = provider._pending[state]["okta_verifier"]
-        await provider.handle_login_get(fake_request(state=state))
-        await provider.handle_login_get(fake_request(state=state))
+        one = set_cookies(await provider.handle_login_get(fake_request(state=state)))
+        two = set_cookies(await provider.handle_login_get(fake_request(state=state)))
         assert provider._pending[state]["okta_verifier"] == first
+        assert one == two
 
     async def test_unknown_state_rejected(self, provider):
         assert (await provider.handle_login_get(fake_request(state="made-up"))).status_code == 400
@@ -102,9 +113,141 @@ class TestLoginHop:
         state cannot be reached."""
         no_okta = make_provider(okta=False)
         _, state = await start_login(no_okta)
-        resp = await no_okta.handle_login_get(fake_request(state=state))
-        assert resp.status_code == 503
-        assert "password" not in resp.body.decode().lower()
+        for resp in (
+            await no_okta.handle_login_get(fake_request(state=state)),
+            await no_okta.handle_login_post(fake_request(method="POST", form={"state": state})),
+        ):
+            assert resp.status_code == 503
+            assert "password" not in resp.body.decode().lower()
+
+
+class TestConsentAndBrowserBinding:
+    """F1. DCR is open, so the client asking for a staff member's code may be an
+    attacker's, and with a live Okta session the chain used to be silent. The
+    human now sees where the code will go and clicks Continue, and the callback
+    is accepted only from the browser that clicked."""
+
+    async def test_login_get_shows_consent_and_does_not_redirect(self, provider):
+        local = "http://localhost:33418/oauth/callback"
+        client = OAuthClientInformationFull(
+            client_id="named",
+            client_name="<script>x</script>",
+            redirect_uris=[local],
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        await provider.register_client(client)
+        target = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="c" * 43,
+                redirect_uri=local,
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        state = parse_qs(urlparse(target).query)["state"][0]
+        resp = await provider.handle_login_get(fake_request(state=state))
+        assert resp.status_code == 200
+        assert "location" not in {k.lower() for k in resp.headers}
+        body = resp.body.decode()
+        assert "http://localhost:33418" in body
+        assert "<script>x</script>" not in body
+        assert "&lt;script&gt;x&lt;/script&gt;" in body
+        cookie = resp.headers["set-cookie"]
+        assert "httponly" in cookie.lower()
+        assert "samesite=lax" in cookie.lower()
+        assert "secure" in cookie.lower()  # our public origin is https
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in resp.headers["content-security-policy"]
+        assert "form-action" not in resp.headers["content-security-policy"]
+        assert resp.headers["cache-control"] == "no-store"
+
+    async def test_a_long_client_name_is_truncated(self, provider):
+        client = OAuthClientInformationFull(
+            client_id="long",
+            client_name="A" * 500,
+            redirect_uris=[CLAUDE_REDIRECT],
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        await provider.register_client(client)
+        target = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state="s",
+                scopes=[],
+                code_challenge="c" * 43,
+                redirect_uri=CLAUDE_REDIRECT,
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        state = parse_qs(urlparse(target).query)["state"][0]
+        body = (await provider.handle_login_get(fake_request(state=state))).body.decode()
+        assert "A" * 81 not in body
+
+    async def test_two_logins_get_different_cookie_names(self, provider):
+        _, one = await start_login(provider)
+        _, two = await start_login(provider)
+        assert set(COOKIE_JAR[one]) != set(COOKIE_JAR[two])
+
+    async def test_callback_without_consent_issues_no_code(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        await provider.handle_login_get(fake_request(state=state))  # page seen, no click
+        resp = await provider.handle_okta_callback(
+            fake_request(state=state, code="okta-code", cookies={})
+        )
+        assert resp.status_code == 400
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert provider._auth_codes == {}
+        assert state in provider._pending  # a stranger cannot burn the login
+
+    async def test_callback_from_a_browser_without_the_cookie_is_refused(self, provider):
+        _, state = await start_login(provider)  # consent given in another jar
+        for cookies in ({}, {login_cookie_name(state): "not-the-token"}):
+            with respx.mock:
+                route = respx.post(OKTA_META["token_endpoint"]).mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={
+                            "id_token": make_id_token(nonce=provider._pending[state]["okta_nonce"])
+                        },
+                    )
+                )
+                resp = await provider.handle_okta_callback(
+                    fake_request(state=state, code="okta-code", cookies=cookies)
+                )
+            assert resp.status_code == 400
+            assert "location" not in {k.lower() for k in resp.headers}
+            assert not route.called  # the Okta code is not spent
+            assert provider._auth_codes == {}
+            assert state in provider._pending
+        # The consenting browser can still finish.
+        ok, _ = await run_callback(provider, state)
+        assert ok.status_code == 302 and "code" in redirect_params(ok)
+
+    async def test_login_post_without_cookie_is_refused(self, provider):
+        _, state = await start_login(provider, give_consent=False)
+        await provider.handle_login_get(fake_request(state=state))
+        for cookies in ({}, {login_cookie_name(state): "forged"}):
+            resp = await provider.handle_login_post(
+                fake_request(method="POST", form={"state": state}, cookies=cookies)
+            )
+            assert resp.status_code == 400
+            assert "location" not in {k.lower() for k in resp.headers}
+            assert not provider._pending[state].get("consented")
+
+    async def test_login_post_with_an_unknown_state_is_refused(self, provider):
+        resp = await provider.handle_login_post(
+            fake_request(method="POST", form={"state": "made-up"}, cookies={})
+        )
+        assert resp.status_code == 400
+
+    async def test_a_finished_login_clears_its_cookie(self, provider):
+        _, state = await start_login(provider)
+        resp, _ = await run_callback(provider, state)
+        cleared = resp.headers["set-cookie"]
+        assert login_cookie_name(state) in cleared
+        assert "max-age=0" in cleared.lower()
 
 
 class TestOktaCallbackHappyPath:

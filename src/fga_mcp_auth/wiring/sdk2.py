@@ -79,12 +79,15 @@ def register_auth_routes(mcp: Any, provider: FGAAuthProvider) -> None:
 
     /login is new to SDK 2.0 consumers: the package uses the login-hop shape from
     fga-quorum-mcp for both SDK lines rather than shipping two flow shapes. The
-    user-visible difference is one extra 302.
+    user-visible difference is the consent page: one extra click per connect.
     """
     require_sdk2()
 
-    @mcp.custom_route("/login", methods=["GET"])
-    async def _login_get(request):
+    # GET renders the consent page; POST is the consent click (state only).
+    @mcp.custom_route("/login", methods=["GET", "POST"])
+    async def _login(request):
+        if request.method == "POST":
+            return await provider.handle_login_post(request)
         return await provider.handle_login_get(request)
 
     @mcp.custom_route("/okta/callback", methods=["GET"])

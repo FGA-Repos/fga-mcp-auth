@@ -78,8 +78,21 @@ class TestHttpAppWiring:
         for path in ("/login", "/okta/callback", "/oauth/error"):
             assert path in routes, f"{path} missing — {sorted(routes)}"
 
-    def test_login_no_longer_accepts_a_password_post(self, app):
-        assert "POST" not in _routes(app)["/login"]
+    def test_login_serves_consent_and_takes_the_click_but_no_password(self, app):
+        """GET renders the consent page, POST is the Continue click (1.3.0).
+        The shared-password form is gone: the POST handler reads only `state`."""
+        import inspect
+
+        from fga_mcp_auth import routes
+
+        assert {"GET", "POST"} <= _routes(app)["/login"]
+        assert "password" not in inspect.getsource(routes.handle_login_post).lower()
+
+    async def test_consent_step_works_over_real_http(self, wired, app):
+        from conftest import assert_consent_over_http
+
+        _mcp, provider, _kwargs = wired
+        await assert_consent_over_http(app, provider)
 
     def test_oauth_endpoints_present(self, app):
         routes = _routes(app)

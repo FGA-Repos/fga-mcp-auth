@@ -6,7 +6,8 @@ Flow:
    are allowlist-checked HERE, see register_client)
 3. Claude redirects the user to GET /authorize -> we stash the request and
    return the relative URL /login?state=...
-4. GET /login 302s to Okta's authorize endpoint (PKCE S256 + nonce + state)
+4. GET /login renders a consent page and sets a browser-binding cookie; the
+   POST it submits 303s to Okta's authorize endpoint (PKCE S256 + nonce + state)
 5. Okta sends the user back to GET /okta/callback; we exchange the code,
    validate the id_token against Okta's JWKS, then issue our auth code and
    redirect to Claude's callback
@@ -547,6 +548,9 @@ class FGAAuthProvider(OAuthAuthorizationServerProvider):
 
     async def handle_login_get(self, request: Request) -> Response:
         return await routes.handle_login_get(self, request)
+
+    async def handle_login_post(self, request: Request) -> Response:
+        return await routes.handle_login_post(self, request)
 
     async def handle_okta_callback(self, request: Request) -> Response:
         return await routes.handle_okta_callback(self, request)

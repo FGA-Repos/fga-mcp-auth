@@ -376,7 +376,7 @@ itself (`GET /api/v1/users/me`, once, 5s, never fatal) and logs the verdict:
 ## Deliberate behavior changes vs. live quorum and ob3 — FLAGGED
 
 Everything else in this package is the safer of the two live implementations.
-These five are **not supersets** of what is running today, so they are listed
+These six are **not supersets** of what is running today, so they are listed
 here to be copied into each retrofit PR body and signed off, rather than
 discovered at deploy time.
 
@@ -387,6 +387,7 @@ discovered at deploy time.
 | 3 | **The service bearer must be slug-bound.** | Both live servers, which run unprefixed bearers. | Their retrofit deploy must set `MCP_REQUIRE_BOUND_BEARER=false`, or the server will not boot. |
 | 4 | **Fail-loud startup**: missing Okta config refuses to boot. | ob3, which could boot with SSO silently disabled. | Nothing, if the env is complete. That is the point. |
 | 5 | **Revocation is advertised as disabled** (`RevocationOptions(enabled=False)`). | Both. | `/revoke` disappears. It never revoked anything — stateless tokens — so it returned 200 while the token kept working. |
+| 6 | **Consent page on every connect** (1.3.0). `GET /login` renders a page naming the redirect target and the client's self-reported name, sets a per-login HttpOnly cookie, and only the `POST` Continue from that browser goes on to Okta. `/okta/callback` refuses on our origin, minting nothing, unless that browser consented. | Every consuming server. `/login` accepts `POST` again — it carries only `state`, no credential. | One extra click per connect (re-auth is at most weekly). It cannot tell an attacker-started claude.ai/cursor.com flow from a real one — the page truthfully names claude.ai — so that half rests on those services binding OAuth `state` to their session. |
 
 Denial messages are the mitigation for (1): the fixed `error_description` for a
 group denial says to ask for the Okta group, and for a domain denial says to use
@@ -431,6 +432,11 @@ wrong leg; everything else runs on both.
   only the loopback hosts; `HTTPS_REDIRECT_DOMAINS` is gone. If Claude ever
   registers another callback, the symptom is `invalid_redirect_uri` at
   `/register` and the fix is one line in `EXACT_REDIRECT_URIS`.
+* **Security — consent step and browser binding on `/login`.** An open DCR
+  client used to be able to drive a staff member with a live Okta session
+  through the whole chain without a click. `/login` now shows a consent page
+  and binds the login to the browser that clicked Continue; see deliberate
+  change 6. `/login` is mounted for `GET` and `POST` on both SDK lines.
 * **Hardening.** The client registry evicts least-recently-used instead of
   FIFO, in-flight logins are capped at `MAX_PENDING` (5000), and Okta's
   `error` / `iss` callback parameters are logged as a bounded `repr` so they

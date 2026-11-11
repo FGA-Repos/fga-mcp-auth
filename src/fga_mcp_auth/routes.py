@@ -89,7 +89,7 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
         return error_redirect(pending, error)
 
     if error := params.get("error"):
-        logger.warning("Okta returned error: %s", error, extra={"event_category": "auth.failure"})
+        logger.warning("Okta returned error: %.200r", error, extra={"event_category": "auth.failure"})
         # Okta's prose is attacker-influenceable, so only a code from our own
         # fixed set travels — never Okta's string, in the page or the redirect.
         # The log keeps the detail.
@@ -100,7 +100,7 @@ async def handle_okta_callback(provider: FGAAuthProvider, request: Request) -> R
     assert provider._okta is not None
     meta = await provider._okta.metadata()
     if (returned := params.get("iss")) and returned.rstrip("/") != meta["issuer"].rstrip("/"):
-        logger.error("Issuer mismatch: got %s want %s", returned, meta["issuer"])
+        logger.error("Issuer mismatch: got %.200r want %s", returned, meta["issuer"])
         return fail("server_error")
 
     code = params.get("code", "")

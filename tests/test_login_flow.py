@@ -532,6 +532,36 @@ class TestCallbackErrorReflection:
         assert q["error"] in REDIRECT_ERRORS
         assert "code" not in q  # no query smuggling through the error string
 
+    async def test_okta_error_param_cannot_forge_a_log_line(self, caplog):
+        """Anyone holding a pending state can choose `error`, and a plain-text
+        log formatter would turn a raw newline into a second, forged record."""
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await provider.handle_okta_callback(
+                fake_request(state=state, error="x\nERROR forged line")
+            )
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages and not any("\n" in m for m in messages)
+        assert any("ERROR forged line" in m for m in messages)  # still there, escaped
+
+    async def test_a_huge_okta_error_param_is_logged_bounded(self, caplog):
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await provider.handle_okta_callback(fake_request(state=state, error="A" * 5000))
+        assert caplog.records
+        assert all(len(r.getMessage()) < 400 for r in caplog.records)
+
+    async def test_a_mismatched_iss_cannot_forge_a_log_line(self, caplog):
+        provider = make_provider()
+        _client, state = await start_login(provider)
+        with caplog.at_level(logging.WARNING):
+            await run_callback(provider, state, iss="https://evil.example\nERROR forged")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Issuer mismatch" in m for m in messages)
+        assert not any("\n" in m for m in messages)
+
 
 class TestPendingStateHygiene:
     async def test_state_key_is_high_entropy_and_unique(self):
